@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Настройки - ESP32 Temperature Monitor</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .settings-container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .settings-header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .settings-header h1 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+        }
+        
+        .back-link {
+            color: white;
+            text-decoration: none;
+            opacity: 0.9;
+            display: inline-block;
+            margin-bottom: 20px;
+        }
+        
+        .back-link:hover {
+            opacity: 1;
+            text-decoration: underline;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .tab-button {
+            flex: 1;
+            min-width: 120px;
+            padding: 12px 20px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .tab-button:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .tab-button.active {
+            background: white;
+            color: #667eea;
+            font-weight: 600;
+        }
+        
+        .tab-content {
+            display: none;
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #212121;
+        }
+        
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+        }
+        
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .form-group small {
+            display: block;
+            margin-top: 5px;
+            color: #757575;
+            font-size: 0.875rem;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 30px;
+        }
+        
+        .btn {
+            flex: 1;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-secondary {
+            background: #e0e0e0;
+            color: #212121;
+        }
+        
+        .btn-secondary:hover {
+            background: #d0d0d0;
+        }
+        
+        .btn-scan {
+            background: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            margin-bottom: 15px;
+        }
+        
+        .btn-scan:hover {
+            background: #45a049;
+        }
+        
+        .wifi-list {
+            max-height: 300px;
+            overflow-y: auto;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 10px;
+            margin-top: 15px;
+        }
+        
+        .wifi-item {
+            padding: 12px;
+            border-bottom: 1px solid #e0e0e0;
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+        
+        .wifi-item:hover {
+            background: #f5f5f5;
+        }
+        
+        .wifi-item:last-child {
+            border-bottom: none;
+        }
+        
+        .wifi-ssid {
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+        
+        .wifi-info {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.875rem;
+            color: #757575;
+        }
+        
+        .wifi-signal {
+            display: inline-block;
+            margin-left: 10px;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #757575;
+        }
+        
+        .message {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .message.show {
+            display: block;
+        }
+        
+        @media (max-width: 768px) {
+            .settings-container {
+                padding: 10px;
+            }
+            
+            .tab-content {
+                padding: 20px;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+            
+            .tab-button {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="settings-container">
+        <div class="settings-header">
+            <a href="/" class="back-link">← Назад к дашборду</a>
+            <h1>⚙️ Настройки</h1>
+        </div>
+        
+        <div id="message" class="message"></div>
+        
+        <div class="tabs">
+            <button class="tab-button active" onclick="showTab('wifi')">📶 Wi-Fi</button>
+            <button class="tab-button" onclick="showTab('mqtt')">📡 MQTT</button>
+            <button class="tab-button" onclick="showTab('telegram')">💬 Telegram</button>
+            <button class="tab-button" onclick="showTab('temperature')">🌡️ Температура</button>
+            <button class="tab-button" onclick="showTab('timezone')">🕐 Часовой пояс</button>
+            <button class="tab-button" onclick="showTab('mode')">⚙️ Режим работы</button>
+            <button class="tab-button" onclick="showTab('sensors')">🌡️ Термометры</button>
+        </div>
+        
+        <!-- Wi-Fi настройки -->
+        <div id="wifi-tab" class="tab-content active">
+            <h2>Настройки Wi-Fi</h2>
+            <button class="btn btn-scan" onclick="scanWiFi()">🔍 Сканировать сети</button>
+            <div id="wifi-list" class="wifi-list" style="display: none;"></div>
+            
+            <form id="wifi-form">
+                <div class="form-group">
+                    <label for="wifi-ssid">SSID (имя сети)</label>
+                    <input type="text" id="wifi-ssid" name="ssid" placeholder="Введите SSID">
+                </div>
+                
+                <div class="form-group">
+                    <label for="wifi-password">Пароль</label>
+                    <input type="password" id="wifi-password" name="password" placeholder="Введите пароль">
+                    <small>Оставьте пустым для открытых сетей</small>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="saveWiFi()">Сохранить и подключиться</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadSettings()">Отмена</button>
+                </div>
+            </form>
+        </div>
+        
+        <!-- MQTT настройки -->
+        <div id="mqtt-tab" class="tab-content">
+            <h2>Настройки MQTT</h2>
+            <form id="mqtt-form">
+                <div class="form-group">
+                    <label for="mqtt-server">Сервер MQTT</label>
+                    <input type="text" id="mqtt-server" name="server" placeholder="mqtt.server.com">
+                </div>
+                
+                <div class="form-group">
+                    <label for="mqtt-port">Порт</label>
+                    <input type="number" id="mqtt-port" name="port" value="1883" min="1" max="65535">
+                </div>
+                
+                <div class="form-group">
+                    <label for="mqtt-user">Имя пользователя</label>
+                    <input type="text" id="mqtt-user" name="user" placeholder="Опционально">
+                </div>
+                
+                <div class="form-group">
+                    <label for="mqtt-password">Пароль</label>
+                    <input type="password" id="mqtt-password" name="password" placeholder="Опционально">
+                </div>
+                
+                <div class="form-group">
+                    <label for="mqtt-topic-status">Топик статуса</label>
+                    <input type="text" id="mqtt-topic-status" name="topic_status" value="home/thermo/status">
+                </div>
+                
+                <div class="form-group">
+                    <label for="mqtt-topic-control">Топик управления</label>
+                    <input type="text" id="mqtt-topic-control" name="topic_control" value="home/thermo/control">
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadSettings()">Отмена</button>
+                </div>
+            </form>
+        </div>
+        
+        <!-- Telegram настройки -->
+        <div id="telegram-tab" class="tab-content">
+            <h2>Настройки Telegram</h2>
+            <form id="telegram-form">
+                <div class="form-group">
+                    <label for="telegram-bot-token">Bot Token</label>
+                    <input type="text" id="telegram-bot-token" name="bot_token" placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz">
+                    <small>Получите у @BotFather в Telegram</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="telegram-chat-id">Chat ID</label>
+                    <input type="text" id="telegram-chat-id" name="chat_id" placeholder="123456789">
+                    <small>Узнайте у @userinfobot в Telegram</small>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadSettings()">Отмена</button>
+                </div>
+            </form>
+        </div>
+        
+        <!-- Настройки температуры -->
+        <div id="temperature-tab" class="tab-content">
+            <h2>Настройки температуры</h2>
+            <form id="temperature-form">
+                <div class="form-group">
+                    <label for="temp-high">Верхний порог (°C)</label>
+                    <input type="number" id="temp-high" name="high_threshold" step="0.1" value="30.0">
+                    <small>Уведомление при превышении этого значения</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="temp-low">Нижний порог (°C)</label>
+                    <input type="number" id="temp-low" name="low_threshold" step="0.1" value="10.0">
+                    <small>Уведомление при падении ниже этого значения</small>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadSettings()">Отмена</button>
+                </div>
+            </form>
+        </div>
+        
+        <!-- Настройки часового пояса -->
+        <div id="timezone-tab" class="tab-content">
+            <h2>Настройки времени</h2>
+            <form id="timezone-form">
+                <div class="form-group">
+                    <label for="timezone-offset">Часовой пояс (UTC)</label>
+                    <select id="timezone-offset" name="offset">
+                        <option value="-12">UTC-12</option>
+                        <option value="-11">UTC-11</option>
+                        <option value="-10">UTC-10</option>
+                        <option value="-9">UTC-9</option>
+                        <option value="-8">UTC-8</option>
+                        <option value="-7">UTC-7</option>
+                        <option value="-6">UTC-6</option>
+                        <option value="-5">UTC-5</option>
+                        <option value="-4">UTC-4</option>
+                        <option value="-3">UTC-3</option>
+                        <option value="-2">UTC-2</option>
+                        <option value="-1">UTC-1</option>
+                        <option value="0">UTC+0</option>
+                        <option value="1">UTC+1</option>
+                        <option value="2">UTC+2</option>
+                        <option value="3" selected>UTC+3 (Москва)</option>
+                        <option value="4">UTC+4</option>
+                        <option value="5">UTC+5</option>
+                        <option value="6">UTC+6</option>
+                        <option value="7">UTC+7</option>
+                        <option value="8">UTC+8</option>
+                        <option value="9">UTC+9</option>
+                        <option value="10">UTC+10</option>
+                        <option value="11">UTC+11</option>
+                        <option value="12">UTC+12</option>
+                    </select>
+                    <small>Время синхронизируется с сервером NTP (pool.ntp.org)</small>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadSettings()">Отмена</button>
+                </div>
+            </form>
+        </div>
+        
+        <!-- Настройки режима работы -->
+        <div id="mode-tab" class="tab-content">
+            <h2>Режим работы термометра</h2>
+            <form id="mode-form">
+                <div class="form-group">
+                    <label for="operation-mode">Режим работы</label>
+                    <select id="operation-mode" name="mode" onchange="updateModeSettings()">
+                        <option value="0">Локальный - только мониторинг</option>
+                        <option value="1">Мониторинг с отправкой</option>
+                        <option value="2">Режим оповещения</option>
+                        <option value="3">Режим стабилизации</option>
+                    </select>
+                    <small id="mode-description">Локальный режим: WiFi включается только при нажатии кнопки</small>
+                </div>
+                
+                <!-- Настройки режима оповещения -->
+                <div id="alert-settings" style="display: none;">
+                    <h3 style="margin-top: 20px; margin-bottom: 15px;">Настройки оповещения</h3>
+                    <div class="form-group">
+                        <label for="alert-min-temp">Минимальная температура (°C)</label>
+                        <input type="number" id="alert-min-temp" name="min_temp" step="0.1" value="10.0">
+                        <small>Тревога при падении ниже этого значения</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="alert-max-temp">Максимальная температура (°C)</label>
+                        <input type="number" id="alert-max-temp" name="max_temp" step="0.1" value="30.0">
+                        <small>Тревога при превышении этого значения</small>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="alert-buzzer" name="buzzer_enabled" checked>
+                            Включить бипер при тревоге
+                        </label>
+                    </div>
+                </div>
+                
+                <!-- Настройки режима стабилизации -->
+                <div id="stabilization-settings" style="display: none;">
+                    <h3 style="margin-top: 20px; margin-bottom: 15px;">Настройки стабилизации</h3>
+                    <div class="form-group">
+                        <label for="stab-target-temp">Целевая температура (°C)</label>
+                        <input type="number" id="stab-target-temp" name="target_temp" step="0.1" value="25.0">
+                        <small>Уставка для стабилизации</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="stab-tolerance">Допуск стабильности (°C)</label>
+                        <input type="number" id="stab-tolerance" name="tolerance" step="0.01" value="0.1">
+                        <small>Допустимое отклонение от уставки (по умолчанию 0.1°C)</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="stab-alert-threshold">Порог тревоги (°C)</label>
+                        <input type="number" id="stab-alert-threshold" name="alert_threshold" step="0.01" value="0.2">
+                        <small>Тревога при превышении этого порога от уставки (по умолчанию 0.2°C)</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="stab-duration">Время работы на уставке (минуты)</label>
+                        <input type="number" id="stab-duration" name="duration" value="10" min="1">
+                        <small>Время стабильной работы для завершения режима (по умолчанию 10 минут)</small>
+                    </div>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="saveModeSettings()">Сохранить</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadModeSettings()">Отмена</button>
+                </div>
+            </form>
+        </div>
+        
+        <!-- Настройки термометров -->
+        <div id="sensors-tab" class="tab-content">
+            <h2>Настройки термометров</h2>
+            <p style="margin-bottom: 20px; color: var(--text-secondary);">Можно настроить до 10 термометров. Для каждого термометра можно задать имя, коррекцию температуры и выбрать, отображать ли его на главном экране.</p>
+            <div id="sensors-list">
+                <!-- Термометры будут добавлены динамически -->
+            </div>
+            <div class="button-group" style="margin-top: 20px;">
+                <button type="button" class="btn btn-primary" onclick="saveSettings('sensors')">Сохранить все</button>
+                <button type="button" class="btn btn-secondary" onclick="addSensor()">+ Добавить термометр</button>
+            </div>
+        </div>
+    </div>
+    
+    <script src="settings.js"></script>
+</body>
+</html>

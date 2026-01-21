@@ -1,0 +1,584 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --primary-color: #2196F3;
+    --secondary-color: #FF9800;
+    --success-color: #4CAF50;
+    --danger-color: #F44336;
+    --background: #f5f5f5;
+    --surface: #ffffff;
+    --text-primary: #212121;
+    --text-secondary: #757575;
+    --shadow: rgba(0, 0, 0, 0.1);
+    --border-radius: 16px;
+    --spacing: 16px;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    padding: var(--spacing);
+    color: var(--text-primary);
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 32px;
+    color: white;
+}
+
+header h1 {
+    font-size: 2rem;
+    font-weight: 600;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.dashboard {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: var(--spacing);
+    margin-bottom: var(--spacing);
+}
+
+.tile {
+    background: var(--surface);
+    border-radius: var(--border-radius);
+    padding: 24px;
+    box-shadow: 0 4px 6px var(--shadow), 0 1px 3px var(--shadow);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    display: flex;
+    flex-direction: column;
+}
+
+.tile:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 12px var(--shadow), 0 2px 6px var(--shadow);
+}
+
+.tile-large {
+    grid-column: span 2;
+}
+
+.tile-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.tile-icon {
+    font-size: 1.5rem;
+}
+
+.tile-title {
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.tile-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.sensors-grid-container {
+    grid-column: span 2;
+}
+
+.sensors-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 16px;
+    width: 100%;
+}
+
+.sensor-cell {
+    background: var(--surface);
+    border-radius: 12px;
+    padding: 16px;
+    box-shadow: 0 2px 4px var(--shadow);
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    width: fit-content;
+    min-width: 180px;
+    max-width: 250px;
+    flex: 0 0 auto;
+    border: 2px solid transparent;
+}
+
+.sensor-cell:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px var(--shadow);
+    border-color: var(--primary-color);
+}
+
+.sensor-name {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.sensor-temp-container {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+    margin-bottom: 8px;
+    white-space: nowrap;
+}
+
+.sensor-temp {
+    font-size: 2.5rem;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--text-primary);
+}
+
+.sensor-temp-unit {
+    font-size: 1.5rem;
+    font-weight: 400;
+    color: var(--text-secondary);
+}
+
+.sensor-mode {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+    font-weight: 500;
+}
+
+.sensor-data {
+    font-size: 0.875rem;
+    margin-bottom: 8px;
+    min-height: 20px;
+}
+
+.alert-min {
+    color: var(--danger-color);
+    font-weight: 600;
+}
+
+.alert-max {
+    color: var(--success-color);
+    font-weight: 600;
+}
+
+.stabilization-state {
+    color: var(--primary-color);
+    font-weight: 600;
+}
+
+.stabilization-threshold {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.sensor-buttons-container {
+    display: flex;
+    gap: 8px;
+    width: 100%;
+    justify-content: center;
+    margin-top: auto;
+}
+
+.sensor-send-button,
+.sensor-buzzer-button {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 12px;
+    font-size: 0.875rem;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    background: var(--surface);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.sensor-send-button.active {
+    background: var(--success-color);
+    color: white;
+    border-color: var(--success-color);
+}
+
+.sensor-buzzer-button.active {
+    background: var(--secondary-color);
+    color: white;
+    border-color: var(--secondary-color);
+}
+
+.sensor-send-button:hover,
+.sensor-buzzer-button:hover {
+    background: #f5f5f5;
+}
+
+.sensor-send-button.active:hover {
+    background: #45a049;
+}
+
+.sensor-buzzer-button.active:hover {
+    background: #e68900;
+}
+
+.wifi-tile {
+    border-top: 4px solid var(--primary-color);
+}
+
+.status-value {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+}
+
+.status-value.connected {
+    color: var(--success-color);
+}
+
+.status-value.disconnected {
+    color: var(--danger-color);
+}
+
+.status-detail {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
+.ip-tile {
+    border-top: 4px solid var(--secondary-color);
+}
+
+.ip-value {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    font-family: 'Courier New', monospace;
+    word-break: break-all;
+}
+
+.uptime-tile {
+    border-top: 4px solid var(--success-color);
+}
+
+.uptime-value {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    font-family: 'Courier New', monospace;
+}
+
+.chart-tile {
+    border-top: 4px solid #FF9800;
+}
+
+.mode-tile {
+    border-top: 4px solid #607D8B;
+}
+
+.mode-select {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    font-size: 1rem;
+    background: white;
+    color: var(--text-primary);
+    cursor: pointer;
+    margin-bottom: 8px;
+}
+
+.mode-description {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    margin-top: 8px;
+}
+
+.mode-settings {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #e0e0e0;
+}
+
+.mode-settings .form-group {
+    margin-bottom: 15px;
+}
+
+.mode-settings label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+/* Wi-Fi иконка в шапке */
+#wifi-status-header {
+    padding: 6px 12px;
+    border-radius: 6px;
+    transition: background-color 0.3s ease;
+}
+
+#wifi-status-header.wifi-weak {
+    background-color: rgba(255, 193, 7, 0.2);
+}
+
+#wifi-icon {
+    display: inline-block;
+    transition: filter 0.3s ease;
+}
+
+#wifi-icon.wifi-connected {
+    filter: hue-rotate(120deg) saturate(1.5);
+}
+
+#wifi-icon.wifi-disconnected {
+    filter: hue-rotate(0deg) saturate(0.5) brightness(0.7);
+}
+
+.wifi-bars {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 16px;
+}
+
+.wifi-bar {
+    width: 3px;
+    background-color: currentColor;
+    border-radius: 1px;
+}
+
+.wifi-bar:nth-child(1) { height: 4px; }
+.wifi-bar:nth-child(2) { height: 6px; }
+.wifi-bar:nth-child(3) { height: 8px; }
+.wifi-bar:nth-child(4) { height: 10px; }
+
+footer {
+    text-align: center;
+    color: white;
+    padding: var(--spacing);
+    opacity: 0.9;
+}
+
+.update-info {
+    font-size: 0.875rem;
+}
+
+/* Адаптивность для мобильных устройств */
+@media (max-width: 768px) {
+    header h1 {
+        font-size: 1.5rem;
+    }
+    
+    .dashboard {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+    
+    .tile-large {
+        grid-column: span 1;
+    }
+    
+    .temperature-value {
+        font-size: 3rem;
+    }
+    
+    .temperature-unit {
+        font-size: 1.5rem;
+    }
+    
+    .tile {
+        padding: 16px;
+    }
+}
+
+@media (max-width: 480px) {
+    body {
+        padding: 8px;
+    }
+    
+    header h1 {
+        font-size: 1.25rem;
+    }
+    
+    .temperature-value {
+        font-size: 2.5rem;
+    }
+    
+    .temperature-unit {
+        font-size: 1.25rem;
+    }
+}
+
+/* Анимация загрузки */
+@keyframes pulse {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.5;
+    }
+}
+
+.loading {
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* Модальное окно */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 20px;
+}
+
+.modal-content {
+    background: white;
+    border-radius: 16px;
+    max-width: 500px;
+    width: 100%;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px;
+    border-bottom: 1px solid #e0e0e0;
+}
+
+.modal-header h2 {
+    margin: 0;
+    font-size: 1.5rem;
+    color: var(--text-primary);
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    font-size: 2rem;
+    cursor: pointer;
+    color: var(--text-secondary);
+    padding: 0;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: background 0.2s ease;
+}
+
+.modal-close:hover {
+    background: #f5f5f5;
+}
+
+.modal-form {
+    padding: 20px;
+}
+
+.modal-form .form-group {
+    margin-bottom: 20px;
+}
+
+.modal-form label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.modal-form input,
+.modal-form select {
+    width: 100%;
+    padding: 10px;
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    font-size: 1rem;
+    transition: border-color 0.3s ease;
+}
+
+.modal-form input:focus,
+.modal-form select:focus {
+    outline: none;
+    border-color: #667eea;
+}
+
+.modal-buttons {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.modal-buttons .btn {
+    flex: 1;
+    padding: 12px 24px;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+.modal-buttons .btn-primary {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+
+.modal-buttons .btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4);
+}
+
+.modal-buttons .btn-secondary {
+    background: #e0e0e0;
+    color: #212121;
+}
+
+.modal-buttons .btn-secondary:hover {
+    background: #d0d0d0;
+}
+
+.mode-settings-group {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px solid #e0e0e0;
+}
+
+.mode-settings-group h3 {
+    margin-bottom: 15px;
+    color: var(--text-primary);
+}
