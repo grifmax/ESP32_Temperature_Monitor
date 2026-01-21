@@ -213,6 +213,9 @@ async function saveWiFi() {
             setTimeout(() => {
                 window.location.reload();
             }, 2000);
+        } else if (connectResult.status === 'connecting') {
+            showMessage('Подключение к сети...', 'success');
+            pollWiFiConnection();
         } else {
             showMessage('Не удалось подключиться к сети. Проверьте пароль.', 'error');
         }
@@ -220,6 +223,31 @@ async function saveWiFi() {
         console.error('Error saving WiFi:', error);
         showMessage('Ошибка сохранения настроек Wi-Fi', 'error');
     }
+}
+
+async function pollWiFiConnection() {
+    const maxAttempts = 15;
+    let attempts = 0;
+    const interval = setInterval(async () => {
+        attempts++;
+        try {
+            const response = await fetch('/api/data');
+            if (!response.ok) return;
+            const data = await response.json();
+            if (data.wifi_status === 'connected') {
+                clearInterval(interval);
+                showMessage(`Успешно подключено! IP: ${data.ip}`, 'success');
+                setTimeout(() => window.location.reload(), 2000);
+                return;
+            }
+        } catch (error) {
+            console.error('Error polling WiFi status:', error);
+        }
+        if (attempts >= maxAttempts) {
+            clearInterval(interval);
+            showMessage('Не удалось подключиться к сети. Проверьте пароль.', 'error');
+        }
+    }, 1000);
 }
 
 // Функция показа сообщения
@@ -249,6 +277,7 @@ async function loadSettings() {
         if (settings.mqtt) {
             document.getElementById('mqtt-server').value = settings.mqtt.server || '';
             document.getElementById('mqtt-port').value = settings.mqtt.port || 1883;
+            document.getElementById('mqtt-security').value = settings.mqtt.security || 'none';
             document.getElementById('mqtt-user').value = settings.mqtt.user || '';
             document.getElementById('mqtt-password').value = settings.mqtt.password || '';
             document.getElementById('mqtt-topic-status').value = settings.mqtt.topic_status || 'home/thermo/status';
@@ -272,26 +301,6 @@ async function loadSettings() {
             document.getElementById('timezone-offset').value = settings.timezone.offset || 3;
         }
         
-        // Заполнить форму режима работы
-        if (settings.operation_mode !== undefined) {
-            document.getElementById('operation-mode').value = settings.operation_mode;
-            updateModeSettings();
-        }
-        
-        // Заполнить настройки режима оповещения
-        if (settings.alert) {
-            document.getElementById('alert-min-temp').value = settings.alert.min_temp || 10.0;
-            document.getElementById('alert-max-temp').value = settings.alert.max_temp || 30.0;
-            document.getElementById('alert-buzzer').checked = settings.alert.buzzer_enabled !== false;
-        }
-        
-        // Заполнить настройки режима стабилизации
-        if (settings.stabilization) {
-            document.getElementById('stab-target-temp').value = settings.stabilization.target_temp || 25.0;
-            document.getElementById('stab-tolerance').value = settings.stabilization.tolerance || 0.1;
-            document.getElementById('stab-alert-threshold').value = settings.stabilization.alert_threshold || 0.2;
-            document.getElementById('stab-duration').value = (settings.stabilization.duration || 600) / 60;
-        }
     } catch (error) {
         console.error('Error loading settings:', error);
         showMessage('Ошибка загрузки настроек', 'error');
@@ -309,6 +318,7 @@ async function saveSettings() {
             mqtt: {
                 server: document.getElementById('mqtt-server').value,
                 port: parseInt(document.getElementById('mqtt-port').value),
+                security: document.getElementById('mqtt-security').value,
                 user: document.getElementById('mqtt-user').value,
                 password: document.getElementById('mqtt-password').value,
                 topic_status: document.getElementById('mqtt-topic-status').value,
@@ -324,28 +334,8 @@ async function saveSettings() {
             },
             timezone: {
                 offset: parseInt(document.getElementById('timezone-offset').value)
-            },
-            operation_mode: parseInt(document.getElementById('operation-mode') ? document.getElementById('operation-mode').value : 0)
+            }
         };
-        
-        // Добавляем настройки режима оповещения, если они есть
-        if (document.getElementById('alert-min-temp')) {
-            settings.alert = {
-                min_temp: parseFloat(document.getElementById('alert-min-temp').value),
-                max_temp: parseFloat(document.getElementById('alert-max-temp').value),
-                buzzer_enabled: document.getElementById('alert-buzzer').checked
-            };
-        }
-        
-        // Добавляем настройки режима стабилизации, если они есть
-        if (document.getElementById('stab-target-temp')) {
-            settings.stabilization = {
-                target_temp: parseFloat(document.getElementById('stab-target-temp').value),
-                tolerance: parseFloat(document.getElementById('stab-tolerance').value),
-                alert_threshold: parseFloat(document.getElementById('stab-alert-threshold').value),
-                duration: parseInt(document.getElementById('stab-duration').value) * 60
-            };
-        }
         
         const response = await fetch('/api/settings', {
             method: 'POST',
@@ -357,6 +347,7 @@ async function saveSettings() {
         
         if (response.ok) {
             showMessage('Настройки успешно сохранены', 'success');
+            updateServiceStatus();
         } else {
             showMessage('Ошибка сохранения настроек', 'error');
         }
@@ -366,88 +357,40 @@ async function saveSettings() {
     }
 }
 
-// Функция обновления настроек режима работы (видимость полей)
-function updateModeSettings() {
-    const mode = parseInt(document.getElementById('operation-mode').value);
-    const alertSettings = document.getElementById('alert-settings');
-    const stabSettings = document.getElementById('stabilization-settings');
-    const descEl = document.getElementById('mode-description');
-    
-    const descriptions = {
-        0: 'Локальный режим: WiFi включается только при нажатии кнопки',
-        1: 'Мониторинг: отправка данных в MQTT и Telegram',
-        2: 'Оповещение: тревога при превышении заданных порогов',
-        3: 'Стабилизация: поддержание температуры в заданном диапазоне'
-    };
-    
-    if (descEl) descEl.textContent = descriptions[mode] || descriptions[0];
-    if (alertSettings) alertSettings.style.display = (mode === 2) ? 'block' : 'none';
-    if (stabSettings) stabSettings.style.display = (mode === 3) ? 'block' : 'none';
+function formatMqttStatus(mqtt) {
+    if (!mqtt) return '--';
+    if (mqtt.status === 'not_configured') return 'Не настроен';
+    if (mqtt.status === 'connected') return 'Подключен';
+    if (mqtt.status === 'waiting_wifi') return 'Ожидание Wi-Fi';
+    if (mqtt.status === 'error') return 'Ошибка';
+    return 'Подключение...';
 }
 
-// Функция загрузки настроек режима работы
-async function loadModeSettings() {
-    try {
-        const response = await fetch('/api/settings');
-        const settings = await response.json();
-        
-        if (settings.operation_mode !== undefined) {
-            document.getElementById('operation-mode').value = settings.operation_mode;
-            updateModeSettings();
-        }
-        
-        if (settings.alert) {
-            document.getElementById('alert-min-temp').value = settings.alert.min_temp || 10.0;
-            document.getElementById('alert-max-temp').value = settings.alert.max_temp || 30.0;
-            document.getElementById('alert-buzzer').checked = settings.alert.buzzer_enabled !== false;
-        }
-        
-        if (settings.stabilization) {
-            document.getElementById('stab-target-temp').value = settings.stabilization.target_temp || 25.0;
-            document.getElementById('stab-tolerance').value = settings.stabilization.tolerance || 0.1;
-            document.getElementById('stab-alert-threshold').value = settings.stabilization.alert_threshold || 0.2;
-            document.getElementById('stab-duration').value = (settings.stabilization.duration || 600) / 60;
-        }
-    } catch (error) {
-        console.error('Error loading mode settings:', error);
-    }
+function formatTelegramStatus(telegram) {
+    if (!telegram) return '--';
+    if (telegram.status === 'not_configured') return 'Не настроен';
+    if (telegram.status === 'connected') return 'Подключен';
+    if (telegram.status === 'not_initialized') return 'Не инициализ.';
+    return 'Подключение...';
 }
 
-// Функция сохранения настроек режима работы
-async function saveModeSettings() {
+async function updateServiceStatus() {
     try {
-        const mode = parseInt(document.getElementById('operation-mode').value);
-        let settings = { operation_mode: mode };
-        
-        if (mode === 2) {
-            settings.alert = {
-                min_temp: parseFloat(document.getElementById('alert-min-temp').value) || 10.0,
-                max_temp: parseFloat(document.getElementById('alert-max-temp').value) || 30.0,
-                buzzer_enabled: document.getElementById('alert-buzzer').checked
-            };
-        } else if (mode === 3) {
-            settings.stabilization = {
-                target_temp: parseFloat(document.getElementById('stab-target-temp').value) || 25.0,
-                tolerance: parseFloat(document.getElementById('stab-tolerance').value) || 0.1,
-                alert_threshold: parseFloat(document.getElementById('stab-alert-threshold').value) || 0.2,
-                duration: parseInt(document.getElementById('stab-duration').value) * 60 || 600
-            };
+        const response = await fetch('/api/data');
+        if (!response.ok) return;
+        const data = await response.json();
+
+        const mqttStatusEl = document.getElementById('mqtt-status-settings');
+        if (mqttStatusEl) {
+            mqttStatusEl.textContent = formatMqttStatus(data.mqtt);
         }
-        
-        const response = await fetch('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(settings)
-        });
-        
-        if (response.ok) {
-            showMessage('Настройки режима сохранены', 'success');
-        } else {
-            showMessage('Ошибка сохранения настроек', 'error');
+
+        const telegramStatusEl = document.getElementById('telegram-status-settings');
+        if (telegramStatusEl) {
+            telegramStatusEl.textContent = formatTelegramStatus(data.telegram);
         }
     } catch (error) {
-        console.error('Error saving mode settings:', error);
-        showMessage('Ошибка сохранения настроек', 'error');
+        console.error('Error updating service status:', error);
     }
 }
 
@@ -598,10 +541,7 @@ function removeSensor(index) {
 // Загрузить настройки при загрузке страницы
 document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
-    // Загружаем настройки режима отдельно, так как они могут быть не в общих настройках
-    if (document.getElementById('operation-mode')) {
-        loadModeSettings();
-    }
     // Загружаем термометры
     loadSensors();
+    updateServiceStatus();
 });

@@ -11,21 +11,71 @@ extern String deviceIP;
 extern int wifiRSSI;
 
 WiFiClientSecure secured_client;
-UniversalTelegramBot bot(TELEGRAM_BOT_TOKEN, secured_client);
+UniversalTelegramBot* bot = nullptr;
+String telegramBotToken = "";
+String telegramChatId = "";
+String telegramActiveToken = "";
+bool telegramInitialized = false;
+bool telegramConfigured = false;
+bool telegramCanSend = false;
+bool telegramLastPollOk = false;
+unsigned long telegramLastPollMs = 0;
+
+static void updateTelegramFlags() {
+  telegramConfigured = telegramBotToken.length() > 0;
+  telegramCanSend = telegramConfigured && telegramChatId.length() > 0;
+}
+
+static void ensureTelegramBot() {
+  updateTelegramFlags();
+  if (!telegramConfigured) {
+    telegramInitialized = false;
+    if (bot) {
+      delete bot;
+      bot = nullptr;
+    }
+    telegramActiveToken = "";
+    return;
+  }
+  if (!bot || telegramActiveToken != telegramBotToken) {
+    if (bot) {
+      delete bot;
+    }
+    bot = new UniversalTelegramBot(telegramBotToken, secured_client);
+    telegramActiveToken = telegramBotToken;
+  }
+  telegramInitialized = true;
+}
 
 void startTelegramBot() {
   // Настройка SSL для Telegram
   // Для ESP32 можно использовать setInsecure() для тестирования
   // В продакшене следует использовать setCACert() с правильным сертификатом
   secured_client.setInsecure(); // Используется для тестирования
-  Serial.println(F("Telegram bot initialized"));
+  ensureTelegramBot();
+  if (telegramConfigured) {
+    Serial.println(F("Telegram bot initialized"));
+  } else {
+    Serial.println(F("Telegram bot not configured"));
+  }
 }
 
 void handleTelegramMessages() {
-  int numNewMessages = bot.getUpdates(0);
+  ensureTelegramBot();
+  if (!bot) {
+    return;
+  }
+
+  int numNewMessages = bot->getUpdates(0);
+  telegramLastPollMs = millis();
+  telegramLastPollOk = (numNewMessages >= 0);
+  if (numNewMessages <= 0) {
+    return;
+  }
+
   for (int i = 0; i < numNewMessages; i++) {
-    String text = bot.messages[i].text;
-    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot->messages[i].text;
+    String chat_id = String(bot->messages[i].chat_id);
     
     if (text == "/start" || text == "/help") {
       String message = "🌡️ ESP32 Temperature Monitor\n\n";
@@ -33,10 +83,10 @@ void handleTelegramMessages() {
       message += "/status - текущий статус\n";
       message += "/temp - текущая температура\n";
       message += "/info - информация об устройстве";
-      bot.sendMessage(String(chat_id), message, "");
+      bot->sendMessage(String(chat_id), message, "");
     } else if (text == "/status" || text == "/temp") {
       String message = "🌡️ Температура: " + String(currentTemp, 1) + "°C";
-      bot.sendMessage(String(chat_id), message, "");
+      bot->sendMessage(String(chat_id), message, "");
     } else if (text == "/info") {
       unsigned long hours = deviceUptime / 3600;
       unsigned long minutes = (deviceUptime % 3600) / 60;
@@ -45,13 +95,14 @@ void handleTelegramMessages() {
       message += "🌐 IP: " + deviceIP + "\n";
       message += "⏱️ Время работы: " + String(hours) + "ч " + String(minutes) + "м\n";
       message += "📶 Wi-Fi RSSI: " + String(wifiRSSI) + " dBm";
-      bot.sendMessage(String(chat_id), message, "");
+      bot->sendMessage(String(chat_id), message, "");
     }
   }
 }
 
 void sendMetricsToTelegram() {
-  if (strlen(TELEGRAM_BOT_TOKEN) == 0 || strlen(TELEGRAM_CHAT_ID) == 0) {
+  ensureTelegramBot();
+  if (!telegramCanSend || !bot) {
     return; // Telegram не настроен
   }
   
@@ -64,12 +115,12 @@ void sendMetricsToTelegram() {
   message += "⏱️ Время работы: " + String(hours) + "ч " + String(minutes) + "м\n";
   message += "📶 Wi-Fi RSSI: " + String(wifiRSSI) + " dBm";
   
-  String chatId = String(TELEGRAM_CHAT_ID);
-  bot.sendMessage(chatId, message, "");
+  bot->sendMessage(telegramChatId, message, "");
 }
 
 void sendTemperatureAlert(float temperature) {
-  if (strlen(TELEGRAM_BOT_TOKEN) == 0 || strlen(TELEGRAM_CHAT_ID) == 0) {
+  ensureTelegramBot();
+  if (!telegramCanSend || !bot) {
     return; // Telegram не настроен
   }
   
@@ -81,6 +132,28 @@ void sendTemperatureAlert(float temperature) {
   }
   alert += String(temperature, 1) + "°C";
   
-  String chatId = String(TELEGRAM_CHAT_ID);
-  bot.sendMessage(chatId, alert, "");
+  bot->sendMessage(telegramChatId, alert, "");
+}
+
+void setTelegramConfig(const String& token, const String& chatId) {
+  telegramBotToken = token;
+  telegramChatId = chatId;
+  ensureTelegramBot();
+}
+
+bool isTelegramConfigured() {
+  updateTelegramFlags();
+  return telegramConfigured;
+}
+
+bool isTelegramInitialized() {
+  return telegramInitialized;
+}
+
+bool isTelegramPollOk() {
+  return telegramLastPollOk;
+}
+
+unsigned long getTelegramLastPollMs() {
+  return telegramLastPollMs;
 }

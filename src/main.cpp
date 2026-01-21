@@ -5,6 +5,7 @@
 #include <OneWire.h>
 #include <U8g2lib.h>
 #include <LittleFS.h>
+#include <ArduinoJson.h>
 #include "config.h"
 #include "web_server.h"
 #include "tg_bot.h"
@@ -15,6 +16,14 @@
 #include "operation_modes.h"
 #include "buzzer.h"
 #include "wifi_power.h"
+
+// Forward declarations for MQTT functions
+void initMqtt();
+void setMqttConfig(const String& server, int port, const String& user, const String& password, const String& topicStatus, const String& topicControl, const String& security);
+void updateMqtt();
+bool isMqttConfigured();
+bool isMqttConnected();
+const char* getMqttStatus();
 
 // Объявления для использования в других модулях
 extern float currentTemp;
@@ -44,6 +53,9 @@ int displayScreen = DISPLAY_OFF;
 unsigned long displayTimeout = 0;
 unsigned long deviceUptime = 0;
 unsigned long deviceStartTime = 0;
+unsigned long wifiConnectedSinceMs = 0;
+unsigned long wifiConnectedSeconds = 0;
+bool wifiWasConnected = false;
 String deviceIP = "";
 int wifiRSSI = 0;
 
@@ -97,6 +109,7 @@ void setup() {
   
   // Инициализация управления WiFi
   initWiFiPower();
+  initMqtt();
   
   deviceStartTime = millis();
   
@@ -107,6 +120,60 @@ void setup() {
   // Инициализация истории
   initTemperatureHistory();
   
+  // Загружаем сохраненные настройки WiFi, Telegram и MQTT (если есть)
+  String savedSsid;
+  String savedPassword;
+  String savedTelegramToken;
+  String savedTelegramChatId;
+  String savedMqttServer;
+  int savedMqttPort = 1883;
+  String savedMqttUser;
+  String savedMqttPassword;
+  String savedMqttTopicStatus;
+  String savedMqttTopicControl;
+  String savedMqttSecurity;
+  {
+    String settingsJson = getSettings();
+    StaticJsonDocument<768> doc;
+    DeserializationError error = deserializeJson(doc, settingsJson);
+    if (!error && doc.containsKey("wifi")) {
+      const char* ssid = doc["wifi"]["ssid"] | "";
+      const char* password = doc["wifi"]["password"] | "";
+      savedSsid = String(ssid);
+      savedPassword = String(password);
+    }
+    if (!error && doc.containsKey("telegram")) {
+      const char* token = doc["telegram"]["bot_token"] | "";
+      const char* chatId = doc["telegram"]["chat_id"] | "";
+      savedTelegramToken = String(token);
+      savedTelegramChatId = String(chatId);
+    }
+    if (!error && doc.containsKey("mqtt")) {
+      savedMqttServer = doc["mqtt"]["server"] | "";
+      savedMqttPort = doc["mqtt"]["port"] | 1883;
+      savedMqttUser = doc["mqtt"]["user"] | "";
+      savedMqttPassword = doc["mqtt"]["password"] | "";
+      savedMqttTopicStatus = doc["mqtt"]["topic_status"] | "";
+      savedMqttTopicControl = doc["mqtt"]["topic_control"] | "";
+      savedMqttSecurity = doc["mqtt"]["security"] | "none";
+    }
+  }
+  {
+    String token = savedTelegramToken.length() > 0 ? savedTelegramToken : String(TELEGRAM_BOT_TOKEN);
+    String chatId = savedTelegramChatId.length() > 0 ? savedTelegramChatId : String(TELEGRAM_CHAT_ID);
+    setTelegramConfig(token, chatId);
+  }
+  {
+    String server = savedMqttServer.length() > 0 ? savedMqttServer : String(MQTT_SERVER);
+    int port = savedMqttPort > 0 ? savedMqttPort : MQTT_PORT;
+    String user = savedMqttUser.length() > 0 ? savedMqttUser : String(MQTT_USER);
+    String password = savedMqttPassword.length() > 0 ? savedMqttPassword : String(MQTT_PASSWORD);
+    String topicStatus = savedMqttTopicStatus.length() > 0 ? savedMqttTopicStatus : String(MQTT_TOPIC_STATUS);
+    String topicControl = savedMqttTopicControl.length() > 0 ? savedMqttTopicControl : String(MQTT_TOPIC_CONTROL);
+    String security = savedMqttSecurity.length() > 0 ? savedMqttSecurity : String("none");
+    setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
+  }
+
   // Получаем режим работы
   OperationMode mode = getOperationMode();
   Serial.print(F("Operation mode: "));
@@ -120,6 +187,9 @@ void setup() {
   // Настройка WiFi
   Serial.println(F("Initializing WiFi..."));
   
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
   if (mode == MODE_LOCAL) {
     // Локальный режим - создаем точку доступа
     Serial.println(F("Starting AP mode..."));
@@ -133,7 +203,11 @@ void setup() {
     // Пробуем подключиться к WiFi
     Serial.println(F("Connecting to WiFi..."));
     enableWiFi();
-    WiFi.begin();
+    if (savedSsid.length() > 0) {
+      WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+    } else {
+      WiFi.begin();
+    }
     
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -258,8 +332,23 @@ void loop() {
   // Управление питанием WiFi
   updateWiFiPower();
   
-  // Обновление информации о WiFi
-  if (isAPMode() || WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+  // Обновление информации о WiFi и времени в сети
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected && !wifiWasConnected) {
+    wifiConnectedSinceMs = millis();
+  }
+  if (!wifiConnected) {
+    wifiConnectedSinceMs = 0;
+    wifiConnectedSeconds = 0;
+  } else if (wifiConnectedSinceMs > 0) {
+    wifiConnectedSeconds = (millis() - wifiConnectedSinceMs) / 1000;
+  }
+  wifiWasConnected = wifiConnected;
+
+  if (wifiConnected && isWiFiEnabled() && !isAPMode()) {
+    deviceIP = WiFi.localIP().toString();
+    wifiRSSI = WiFi.RSSI();
+  } else if (isAPMode() || WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
     static unsigned long lastAPCheck = 0;
     if (millis() - lastAPCheck > 2000) {
       lastAPCheck = millis();
@@ -269,9 +358,6 @@ void loop() {
       }
     }
     wifiRSSI = 0;
-  } else if (WiFi.status() == WL_CONNECTED && isWiFiEnabled() && !isAPMode()) {
-    deviceIP = WiFi.localIP().toString();
-    wifiRSSI = WiFi.RSSI();
   } else {
     if (!isWiFiEnabled() && !isAPMode()) {
       deviceIP = "WiFi OFF";
@@ -297,6 +383,8 @@ void loop() {
   if (isWiFiEnabled()) {
     updateTime();
   }
+  
+  updateMqtt();
   
   OperationMode mode = getOperationMode();
   
@@ -353,7 +441,7 @@ void loop() {
   }
   
   // Обработка Telegram сообщений
-  if (isWiFiEnabled() && millis() - lastTelegramUpdate > 1000) {
+  if (WiFi.status() == WL_CONNECTED && millis() - lastTelegramUpdate > 1000) {
     handleTelegramMessages();
     lastTelegramUpdate = millis();
   }

@@ -38,59 +38,36 @@
                 </div>
             </div>
             
-            <!-- Режим работы -->
-            <div class="tile mode-tile">
+            <!-- Сеть и сервисы -->
+            <div class="tile">
                 <div class="tile-header">
-                    <span class="tile-icon">⚙️</span>
-                    <span class="tile-title">Режим работы</span>
+                    <span class="tile-icon">🌐</span>
+                    <span class="tile-title">Сеть и сервисы</span>
                 </div>
-                <div class="tile-content">
-                    <select id="operation-mode-main" class="mode-select" onchange="changeModeFromMain(this.value)">
-                        <option value="0">Локальный</option>
-                        <option value="1">Мониторинг</option>
-                        <option value="2">Оповещение</option>
-                        <option value="3">Стабилизация</option>
-                    </select>
-                    <div class="mode-description" id="mode-description-main">Локальный режим: WiFi включается только при нажатии кнопки</div>
-                    
-                    <!-- Настройки режима оповещения -->
-                    <div id="alert-settings-main" class="mode-settings" style="display: none;">
-                        <div class="form-group">
-                            <label>Минимальная температура (°C)</label>
-                            <input type="number" id="alert-min-temp-main" step="0.1" value="10.0" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 6px;">
-                        </div>
-                        <div class="form-group">
-                            <label>Максимальная температура (°C)</label>
-                            <input type="number" id="alert-max-temp-main" step="0.1" value="30.0" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 6px;">
-                        </div>
-                        <div class="form-group">
-                            <label><input type="checkbox" id="alert-buzzer-main" checked> Включить бипер при тревоге</label>
-                        </div>
-                        <button onclick="saveModeSettings()" style="padding: 8px 16px; background: #667eea; color: white; border: none; border-radius: 6px; cursor: pointer;">Сохранить</button>
+                <div class="tile-content status-list">
+                    <div class="status-row">
+                        <span class="status-label">Wi-Fi</span>
+                        <span id="wifi-status-text" class="status-value">--</span>
                     </div>
-                    
-                    <!-- Настройки режима стабилизации -->
-                    <div id="stabilization-settings-main" class="mode-settings" style="display: none;">
-                        <div class="form-group">
-                            <label>Целевая температура (°C)</label>
-                            <input type="number" id="stab-target-temp-main" step="0.1" value="25.0" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 6px;">
-                        </div>
-                        <div class="form-group">
-                            <label>Допуск стабильности (°C)</label>
-                            <input type="number" id="stab-tolerance-main" step="0.01" value="0.1" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 6px;">
-                        </div>
-                        <div class="form-group">
-                            <label>Порог тревоги (°C)</label>
-                            <input type="number" id="stab-alert-threshold-main" step="0.01" value="0.2" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 6px;">
-                        </div>
-                        <div class="form-group">
-                            <label>Время работы на уставке (минуты)</label>
-                            <input type="number" id="stab-duration-main" value="10" min="1" style="width: 100%; padding: 8px; border: 1px solid #e0e0e0; border-radius: 6px;">
-                        </div>
-                        <div class="form-group">
-                            <label><input type="checkbox" id="stab-buzzer-main" checked> Включить бипер</label>
-                        </div>
-                        <button onclick="saveModeSettings()" style="padding: 8px 16px; background: #667eea; color: white; border: none; border-radius: 6px; cursor: pointer;">Сохранить</button>
+                    <div class="status-row">
+                        <span class="status-label">IP</span>
+                        <span id="ip-address-main" class="status-mono">--</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">В сети</span>
+                        <span id="wifi-connected-time" class="status-value">--</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Время</span>
+                        <span id="current-time" class="status-mono">--</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">MQTT</span>
+                        <span id="mqtt-status" class="status-value">--</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Telegram</span>
+                        <span id="telegram-status" class="status-value">--</span>
                     </div>
                 </div>
             </div>

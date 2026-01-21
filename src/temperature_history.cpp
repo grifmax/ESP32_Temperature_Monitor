@@ -84,6 +84,11 @@ TemperatureRecord* getHistoryForPeriod(unsigned long startTime, unsigned long en
     }
     filtered = (TemperatureRecord*)malloc(filteredCount * sizeof(TemperatureRecord));
     filteredSize = filteredCount;
+    if (filtered == nullptr) {
+      filteredSize = 0;
+      *count = 0;
+      return nullptr;
+    }
   }
   
   // Заполняем массив

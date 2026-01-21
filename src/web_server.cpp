@@ -9,12 +9,15 @@
 #include "temperature_history.h"
 #include "operation_modes.h"
 #include "buzzer.h"
+#include "tg_bot.h"
+#include "mqtt_client.h"
 
 extern float currentTemp;
 extern unsigned long deviceUptime;
 extern String deviceIP;
 extern int wifiRSSI;
 extern int displayScreen;
+extern unsigned long wifiConnectedSeconds;
 // extern WiFiManager wm;  // Временно отключено
 
 AsyncWebServer server(80);
@@ -48,7 +51,7 @@ void startWebServer() {
   // JSON API endpoint для получения данных
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
     // Оптимизировано с 512 до 384 для экономии памяти
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<640> doc;
     
     doc["temperature"] = currentTemp;
     doc["ip"] = deviceIP;
@@ -56,6 +59,7 @@ void startWebServer() {
     doc["wifi_status"] = WiFi.status() == WL_CONNECTED ? "connected" : "disconnected";
     doc["wifi_rssi"] = wifiRSSI;
     doc["display_screen"] = displayScreen;
+    doc["wifi_connected_seconds"] = wifiConnectedSeconds;
     
     // Форматирование uptime
     unsigned long hours = deviceUptime / 3600;
@@ -64,11 +68,49 @@ void startWebServer() {
     char uptimeStr[32];
     snprintf(uptimeStr, sizeof(uptimeStr), "%luh %lum %lus", hours, minutes, seconds);
     doc["uptime_formatted"] = uptimeStr;
+
+    // Форматирование времени в сети
+    if (WiFi.status() == WL_CONNECTED && wifiConnectedSeconds > 0) {
+      unsigned long wifiHours = wifiConnectedSeconds / 3600;
+      unsigned long wifiMinutes = (wifiConnectedSeconds % 3600) / 60;
+      unsigned long wifiSeconds = wifiConnectedSeconds % 60;
+      char wifiUptimeStr[32];
+      snprintf(wifiUptimeStr, sizeof(wifiUptimeStr), "%luh %lum %lus", wifiHours, wifiMinutes, wifiSeconds);
+      doc["wifi_connected_formatted"] = wifiUptimeStr;
+    } else {
+      doc["wifi_connected_formatted"] = "--";
+    }
     
     // Добавление времени
     doc["current_time"] = getCurrentTime();
     doc["current_date"] = getCurrentDate();
     doc["unix_time"] = getUnixTime();
+    doc["time_synced"] = getUnixTime() > 0;
+
+    // Статусы сервисов
+    bool mqttConfigured = isMqttConfigured();
+    doc["mqtt"]["configured"] = mqttConfigured;
+    doc["mqtt"]["status"] = getMqttStatus();
+
+    bool telegramConfigured = isTelegramConfigured();
+    bool telegramInitialized = isTelegramInitialized();
+    bool telegramPollOk = isTelegramPollOk();
+    unsigned long lastPollMs = getTelegramLastPollMs();
+    const char* telegramStatus = "not_configured";
+    if (telegramConfigured) {
+      if (telegramPollOk && lastPollMs > 0 && (millis() - lastPollMs) < 30000) {
+        telegramStatus = "connected";
+      } else if (telegramInitialized) {
+        telegramStatus = "connecting";
+      } else {
+        telegramStatus = "not_initialized";
+      }
+    }
+    doc["telegram"]["configured"] = telegramConfigured;
+    doc["telegram"]["status"] = telegramStatus;
+    if (lastPollMs > 0) {
+      doc["telegram"]["last_poll_age"] = (millis() - lastPollMs) / 1000;
+    }
     
     // Информация о режиме работы
     OperationMode mode = getOperationMode();
@@ -139,6 +181,15 @@ void startWebServer() {
   // API для запуска сканирования Wi-Fi сетей (асинхронное)
   server.on("/api/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *request){
     Serial.println(F("WiFi scan requested..."));
+
+    // Убеждаемся, что WiFi в режиме, позволяющем сканировать
+    if (WiFi.getMode() == WIFI_AP) {
+      WiFi.mode(WIFI_AP_STA);
+      delay(100);
+    } else if (WiFi.getMode() == WIFI_OFF) {
+      WiFi.mode(WIFI_STA);
+      delay(100);
+    }
     
     // Проверяем, есть ли уже результаты сканирования
     int n = WiFi.scanComplete();
@@ -368,24 +419,32 @@ void startWebServer() {
       String password = doc["password"] | "";
       
       if (ssid.length() > 0) {
-        WiFi.disconnect();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
         WiFi.begin(ssid.c_str(), password.c_str());
-        
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-          delay(500);
-          attempts++;
-        }
-        
-        if (WiFi.status() == WL_CONNECTED) {
-          request->send(200, "application/json", "{\"status\":\"connected\",\"ip\":\"" + WiFi.localIP().toString() + "\"}");
-        } else {
-          request->send(500, "application/json", "{\"status\":\"failed\"}");
-        }
+        request->send(200, "application/json", "{\"status\":\"connecting\"}");
       } else {
         request->send(400, "application/json", "{\"status\":\"invalid\"}");
       }
     });
+  
+  // Обработчик для OPTIONS запросов (CORS preflight)
+  server.onNotFound([](AsyncWebServerRequest *request){
+    if (request->method() == HTTP_OPTIONS) {
+      AsyncWebServerResponse *response = request->beginResponse(200);
+      response->addHeader("Access-Control-Allow-Origin", "*");
+      response->addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      response->addHeader("Access-Control-Allow-Headers", "Content-Type");
+      request->send(response);
+    } else if (request->url() == "/favicon.ico") {
+      // Отправляем пустой ответ для favicon.ico
+      request->send(204);
+    } else {
+      // 404 для всех остальных необработанных запросов
+      request->send(404, "text/plain", "Not Found");
+    }
+  });
   
   server.begin();
   Serial.println(F("Web server started"));
@@ -405,6 +464,7 @@ String getSettings() {
     doc["mqtt"]["password"] = "";
     doc["mqtt"]["topic_status"] = "home/thermo/status";
     doc["mqtt"]["topic_control"] = "home/thermo/control";
+    doc["mqtt"]["security"] = "none";
     doc["telegram"]["bot_token"] = "";
     doc["telegram"]["chat_id"] = "";
     doc["temperature"]["high_threshold"] = 30.0;
@@ -467,6 +527,23 @@ bool saveSettings(String json) {
   if (doc.containsKey("operation_mode")) {
     int mode = doc["operation_mode"];
     setOperationMode((OperationMode)mode);
+  }
+  if (doc.containsKey("telegram")) {
+    String token = doc["telegram"]["bot_token"] | "";
+    String chatId = doc["telegram"]["chat_id"] | "";
+    if (token.length() > 0 || chatId.length() > 0) {
+      setTelegramConfig(token, chatId);
+    }
+  }
+  if (doc.containsKey("mqtt")) {
+    String server = doc["mqtt"]["server"] | "";
+    int port = doc["mqtt"]["port"] | 1883;
+    String user = doc["mqtt"]["user"] | "";
+    String password = doc["mqtt"]["password"] | "";
+    String topicStatus = doc["mqtt"]["topic_status"] | "home/thermo/status";
+    String topicControl = doc["mqtt"]["topic_control"] | "home/thermo/control";
+    String security = doc["mqtt"]["security"] | "none";
+    setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
   }
   if (doc.containsKey("alert")) {
     float minTemp = doc["alert"]["min_temp"] | 10.0;

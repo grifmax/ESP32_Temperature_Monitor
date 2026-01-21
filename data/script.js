@@ -8,9 +8,15 @@ const elements = {
     wifiRssiHeader: document.getElementById('wifi-rssi-header'),
     wifiStatusHeader: document.getElementById('wifi-status-header'),
     ipAddressHeader: document.getElementById('ip-address-header'),
-    uptime: document.getElementById('uptime'),
+    uptimeHeaderValue: document.getElementById('uptime-header-value'),
     lastUpdate: document.getElementById('last-update'),
-    sensorsGrid: document.getElementById('sensors-grid')
+    sensorsGrid: document.getElementById('sensors-grid'),
+    wifiStatusText: document.getElementById('wifi-status-text'),
+    ipAddressMain: document.getElementById('ip-address-main'),
+    wifiConnectedTime: document.getElementById('wifi-connected-time'),
+    currentTime: document.getElementById('current-time'),
+    mqttStatus: document.getElementById('mqtt-status'),
+    telegramStatus: document.getElementById('telegram-status')
 };
 
 // Состояние
@@ -54,10 +60,38 @@ function updateUI(data) {
     if (elements.ipAddressHeader) {
         elements.ipAddressHeader.textContent = data.ip || '--';
     }
+
+    if (elements.ipAddressMain) {
+        elements.ipAddressMain.textContent = data.ip || '--';
+    }
     
     // Uptime
-    if (elements.uptime) {
-        elements.uptime.textContent = data.uptime_formatted || '--';
+    if (elements.uptimeHeaderValue) {
+        elements.uptimeHeaderValue.textContent = data.uptime_formatted || '--';
+    }
+
+    if (elements.wifiConnectedTime) {
+        elements.wifiConnectedTime.textContent = data.wifi_connected_formatted || '--';
+    }
+
+    if (elements.currentTime) {
+        if (data.time_synced) {
+            elements.currentTime.textContent = data.current_time || '--:--:--';
+        } else {
+            elements.currentTime.textContent = 'Не синхр.';
+        }
+    }
+
+    if (elements.wifiStatusText) {
+        elements.wifiStatusText.textContent = data.wifi_status === 'connected' ? 'Подключен' : 'Отключен';
+    }
+
+    if (elements.mqttStatus) {
+        elements.mqttStatus.textContent = formatMqttStatus(data.mqtt);
+    }
+
+    if (elements.telegramStatus) {
+        elements.telegramStatus.textContent = formatTelegramStatus(data.telegram);
     }
     
     // Обновляем данные термометров
@@ -70,6 +104,23 @@ function updateUI(data) {
         });
         renderSensorCells();
     }
+}
+
+function formatMqttStatus(mqtt) {
+    if (!mqtt) return '--';
+    if (mqtt.status === 'not_configured') return 'Не настроен';
+    if (mqtt.status === 'connected') return 'Подключен';
+    if (mqtt.status === 'waiting_wifi') return 'Ожидание Wi-Fi';
+    if (mqtt.status === 'error') return 'Ошибка';
+    return 'Подключение...';
+}
+
+function formatTelegramStatus(telegram) {
+    if (!telegram) return '--';
+    if (telegram.status === 'not_configured') return 'Не настроен';
+    if (telegram.status === 'connected') return 'Подключен';
+    if (telegram.status === 'not_initialized') return 'Не инициализ.';
+    return 'Подключение...';
 }
 
 // Загрузка списка термометров
@@ -387,75 +438,6 @@ function updateWiFiHeader(status, rssi) {
         elements.wifiRssiHeader.textContent = 'Отключено';
         elements.wifiStatusHeader.classList.remove('wifi-weak');
     }
-}
-
-function saveModeSettings() {
-    const mode = parseInt(document.getElementById('operation-mode-main').value);
-    
-    let settings = {};
-    
-    if (mode === 2) {
-        // Режим оповещения
-        settings = {
-            mode: mode,
-            alert: {
-                min_temp: parseFloat(document.getElementById('alert-min-temp-main').value) || 10.0,
-                max_temp: parseFloat(document.getElementById('alert-max-temp-main').value) || 30.0,
-                buzzer_enabled: document.getElementById('alert-buzzer-main').checked
-            }
-        };
-    } else if (mode === 3) {
-        // Режим стабилизации
-        settings = {
-            mode: mode,
-            stabilization: {
-                target_temp: parseFloat(document.getElementById('stab-target-temp-main').value) || 25.0,
-                tolerance: parseFloat(document.getElementById('stab-tolerance-main').value) || 0.1,
-                alert_threshold: parseFloat(document.getElementById('stab-alert-threshold-main').value) || 0.2,
-                duration: parseInt(document.getElementById('stab-duration-main').value) || 10,
-                buzzer_enabled: document.getElementById('stab-buzzer-main').checked
-            }
-        };
-    } else {
-        settings = { mode: mode };
-    }
-    
-    fetch('/api/mode', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(settings)
-    })
-    .then(response => response.json())
-    .then(data => {
-        alert('Настройки режима сохранены!');
-    })
-    .catch(error => {
-        console.error('Error saving mode settings:', error);
-        alert('Ошибка сохранения настроек');
-    });
-}
-
-function changeModeFromMain(mode) {
-    const modeNum = parseInt(mode);
-    updateModeDescription(modeNum);
-    
-    // Отправляем изменение режима на сервер
-    fetch('/api/mode', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ mode: modeNum })
-    })
-    .then(response => response.json())
-    .then(data => {
-        console.log('Mode changed:', data);
-    })
-    .catch(error => {
-        console.error('Error changing mode:', error);
-    });
 }
 
 // Функция показа ошибки

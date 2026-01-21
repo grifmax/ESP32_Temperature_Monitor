@@ -267,6 +267,29 @@ header h1 {
     color: var(--text-secondary);
 }
 
+.status-list {
+    gap: 10px;
+}
+
+.status-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 4px 0;
+}
+
+.status-label {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
+.status-mono {
+    font-family: 'Courier New', monospace;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+}
+
 .ip-tile {
     border-top: 4px solid var(--secondary-color);
 }
