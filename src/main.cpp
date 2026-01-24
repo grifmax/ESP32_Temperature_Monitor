@@ -4,7 +4,7 @@
 #include <DallasTemperature.h>
 #include <OneWire.h>
 #include <U8g2lib.h>
-#include <LittleFS.h>
+#include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include "config.h"
 #include "web_server.h"
@@ -16,14 +16,7 @@
 #include "operation_modes.h"
 #include "buzzer.h"
 #include "wifi_power.h"
-
-// Forward declarations for MQTT functions
-void initMqtt();
-void setMqttConfig(const String& server, int port, const String& user, const String& password, const String& topicStatus, const String& topicControl, const String& security);
-void updateMqtt();
-bool isMqttConfigured();
-bool isMqttConnected();
-const char* getMqttStatus();
+#include "mqtt_client.h"
 
 // Объявления для использования в других модулях
 extern float currentTemp;
@@ -47,6 +40,7 @@ float lastSentTemp = 0.0;
 float targetTemp = 25.0;
 unsigned long lastSensorUpdate = 0;
 unsigned long lastTelegramUpdate = 0;
+unsigned long lastMqttMetricsUpdate = 0;
 
 // Переменные для дисплея и кнопки
 int displayScreen = DISPLAY_OFF;
@@ -74,11 +68,19 @@ void setup() {
   Serial.println(F("ESP32 Temperature Monitor Starting..."));
   Serial.println(F("========================================"));
   
-  // Инициализация LittleFS (используем раздел "spiffs")
-  if (!LittleFS.begin(true, "/littlefs", 10, "spiffs")) {
-    Serial.println(F("ERROR: Failed to mount LittleFS"));
+  // Инициализация SPIFFS
+  Serial.println(F("Mounting SPIFFS..."));
+  if (!SPIFFS.begin(false)) {
+    Serial.println(F("ERROR: Failed to mount SPIFFS, trying to format..."));
+    if (!SPIFFS.format()) {
+      Serial.println(F("ERROR: Failed to format SPIFFS!"));
+    } else {
+      Serial.println(F("SPIFFS formatted, restarting..."));
+      delay(2000);
+      ESP.restart();
+    }
   } else {
-    Serial.println(F("LittleFS mounted OK"));
+    Serial.println(F("SPIFFS mounted OK"));
   }
   
   // Инициализация I2C
@@ -141,6 +143,10 @@ void setup() {
       const char* password = doc["wifi"]["password"] | "";
       savedSsid = String(ssid);
       savedPassword = String(password);
+      Serial.print(F("Loaded WiFi SSID: "));
+      Serial.println(savedSsid.length() > 0 ? savedSsid : "(empty)");
+    } else {
+      Serial.println(F("No WiFi settings found in config"));
     }
     if (!error && doc.containsKey("telegram")) {
       const char* token = doc["telegram"]["bot_token"] | "";
@@ -149,7 +155,14 @@ void setup() {
       savedTelegramChatId = String(chatId);
     }
     if (!error && doc.containsKey("mqtt")) {
-      savedMqttServer = doc["mqtt"]["server"] | "";
+      String server = doc["mqtt"]["server"] | "";
+      server.trim();
+      // Проверяем валидность адреса сервера
+      if (server.length() > 0 && server != "#" && server != "null") {
+        savedMqttServer = server;
+      } else {
+        savedMqttServer = "";
+      }
       savedMqttPort = doc["mqtt"]["port"] | 1883;
       savedMqttUser = doc["mqtt"]["user"] | "";
       savedMqttPassword = doc["mqtt"]["password"] | "";
@@ -174,10 +187,31 @@ void setup() {
     setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
   }
 
-  // Получаем режим работы
-  OperationMode mode = getOperationMode();
-  Serial.print(F("Operation mode: "));
-  Serial.println(mode);
+  // Загружаем режим работы из настроек
+  OperationMode mode = MODE_LOCAL; // По умолчанию
+  {
+    String settingsJson = getSettings();
+    StaticJsonDocument<256> modeDoc;
+    DeserializationError error = deserializeJson(modeDoc, settingsJson);
+    if (!error && modeDoc.containsKey("operation_mode")) {
+      int modeValue = modeDoc["operation_mode"] | 0;
+      mode = (OperationMode)modeValue;
+      Serial.print(F("Loaded operation mode: "));
+      Serial.println(mode);
+    } else {
+      Serial.println(F("No saved operation mode"));
+    }
+  }
+  
+  // Если есть сохраненный SSID, но режим MODE_LOCAL - переключаем на MODE_MONITORING
+  // чтобы устройство подключалось к WiFi, а не создавало точку доступа
+  if (mode == MODE_LOCAL && savedSsid.length() > 0) {
+    mode = MODE_MONITORING;
+    Serial.println(F("SSID found but mode is LOCAL - switching to MONITORING to connect to WiFi"));
+  }
+  
+  // Устанавливаем режим работы
+  setOperationMode(mode);
   
   // Инициализация времени (требует WiFi)
   if (mode != MODE_LOCAL) {
@@ -203,15 +237,20 @@ void setup() {
     // Пробуем подключиться к WiFi
     Serial.println(F("Connecting to WiFi..."));
     enableWiFi();
+    
     if (savedSsid.length() > 0) {
+      Serial.print(F("Connecting to SSID: "));
+      Serial.println(savedSsid);
       WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
     } else {
-      WiFi.begin();
+      Serial.println(F("No saved SSID, trying to reconnect to last network..."));
+      WiFi.begin(); // Пробуем подключиться к последней сети
     }
     
     int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) { // Увеличиваем до 30 попыток (15 секунд)
       delay(500);
+      yield(); // Даем время другим задачам
       Serial.print(".");
       attempts++;
     }
@@ -345,10 +384,19 @@ void loop() {
   }
   wifiWasConnected = wifiConnected;
 
-  if (wifiConnected && isWiFiEnabled() && !isAPMode()) {
-    deviceIP = WiFi.localIP().toString();
-    wifiRSSI = WiFi.RSSI();
-  } else if (isAPMode() || WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+  // Приоритет: если WiFi подключен к сети, используем localIP
+  if (wifiConnected && isWiFiEnabled()) {
+    IPAddress localIP = WiFi.localIP();
+    if (localIP.toString() != "0.0.0.0") {
+      deviceIP = localIP.toString();
+      wifiRSSI = WiFi.RSSI();
+    } else {
+      // WiFi подключен, но IP еще не получен
+      deviceIP = "Получение IP...";
+      wifiRSSI = WiFi.RSSI();
+    }
+  } else if (isAPMode() || WiFi.getMode() == WIFI_AP || (WiFi.getMode() == WIFI_AP_STA && !wifiConnected)) {
+    // Режим точки доступа или AP_STA без подключения к WiFi
     static unsigned long lastAPCheck = 0;
     if (millis() - lastAPCheck > 2000) {
       lastAPCheck = millis();
@@ -359,6 +407,7 @@ void loop() {
     }
     wifiRSSI = 0;
   } else {
+    // WiFi не подключен и не в режиме AP
     if (!isWiFiEnabled() && !isAPMode()) {
       deviceIP = "WiFi OFF";
     } else if (!isAPMode()) {
@@ -385,6 +434,12 @@ void loop() {
   }
   
   updateMqtt();
+  
+  // Отправка метрик аптайма в MQTT каждые 60 секунд
+  if (isMqttConnected() && millis() - lastMqttMetricsUpdate > 60000) {
+    sendMqttMetrics(deviceUptime, currentTemp, deviceIP, wifiRSSI);
+    lastMqttMetricsUpdate = millis();
+  }
   
   OperationMode mode = getOperationMode();
   
@@ -440,11 +495,15 @@ void loop() {
     }
   }
   
-  // Обработка Telegram сообщений
-  if (WiFi.status() == WL_CONNECTED && millis() - lastTelegramUpdate > 1000) {
+  // Обработка Telegram сообщений (каждые 5 секунд, чтобы не перегружать API)
+  static unsigned long lastTelegramPoll = 0;
+  if (WiFi.status() == WL_CONNECTED && millis() - lastTelegramPoll > 5000) {
     handleTelegramMessages();
-    lastTelegramUpdate = millis();
+    lastTelegramPoll = millis();
   }
+  
+  // Обработка очереди Telegram сообщений (каждые 100 мс, но только если есть сообщения)
+  processTelegramQueue();
   
   updateDisplay();
 }

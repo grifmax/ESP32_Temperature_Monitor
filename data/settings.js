@@ -290,12 +290,6 @@ async function loadSettings() {
             document.getElementById('telegram-chat-id').value = settings.telegram.chat_id || '';
         }
         
-        // Заполнить форму температуры
-        if (settings.temperature) {
-            document.getElementById('temp-high').value = settings.temperature.high_threshold || 30.0;
-            document.getElementById('temp-low').value = settings.temperature.low_threshold || 10.0;
-        }
-        
         // Заполнить форму часового пояса
         if (settings.timezone) {
             document.getElementById('timezone-offset').value = settings.timezone.offset || 3;
@@ -327,10 +321,6 @@ async function saveSettings() {
             telegram: {
                 bot_token: document.getElementById('telegram-bot-token').value,
                 chat_id: document.getElementById('telegram-chat-id').value
-            },
-            temperature: {
-                high_threshold: parseFloat(document.getElementById('temp-high').value),
-                low_threshold: parseFloat(document.getElementById('temp-low').value)
             },
             timezone: {
                 offset: parseInt(document.getElementById('timezone-offset').value)
@@ -536,6 +526,52 @@ function removeSensor(index) {
     
     sensors.splice(index, 1);
     renderSensors();
+}
+
+// Функция отправки тестового сообщения в Telegram
+async function sendTelegramTest() {
+    try {
+        const response = await fetch('/api/telegram/test', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok && result.status === 'ok') {
+            showMessage('Тестовое сообщение отправлено в Telegram', 'success');
+        } else {
+            showMessage('Ошибка отправки тестового сообщения: ' + (result.message || 'Неизвестная ошибка'), 'error');
+        }
+    } catch (error) {
+        console.error('Error sending Telegram test:', error);
+        showMessage('Ошибка отправки тестового сообщения в Telegram', 'error');
+    }
+}
+
+// Функция отправки тестового сообщения в MQTT
+async function sendMqttTest() {
+    try {
+        const response = await fetch('/api/mqtt/test', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok && result.status === 'ok') {
+            showMessage('Тестовое сообщение отправлено в MQTT', 'success');
+        } else {
+            showMessage('Ошибка отправки тестового сообщения: ' + (result.message || 'Неизвестная ошибка'), 'error');
+        }
+    } catch (error) {
+        console.error('Error sending MQTT test:', error);
+        showMessage('Ошибка отправки тестового сообщения в MQTT', 'error');
+    }
 }
 
 // Загрузить настройки при загрузке страницы

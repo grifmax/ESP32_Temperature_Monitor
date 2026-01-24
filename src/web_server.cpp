@@ -1,7 +1,8 @@
 #include "web_server.h"
+#include <Arduino.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-#include <LittleFS.h>
+#include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
 // #include <WiFiManager.h>  // Временно отключено
@@ -28,24 +29,24 @@ AsyncWebServer server(80);
 void startWebServer() {
   // Главная страница
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(LittleFS, "/index.html", "text/html");
+    request->send(SPIFFS, "/index.html", "text/html");
   });
   
   // Статические файлы (без gzip)
   server.on("/index.html", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(LittleFS, "/index.html", "text/html");
+    request->send(SPIFFS, "/index.html", "text/html");
   });
   server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(LittleFS, "/style.css", "text/css");
+    request->send(SPIFFS, "/style.css", "text/css");
   });
   server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(LittleFS, "/script.js", "application/javascript");
+    request->send(SPIFFS, "/script.js", "application/javascript");
   });
   server.on("/settings.html", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(LittleFS, "/settings.html", "text/html");
+    request->send(SPIFFS, "/settings.html", "text/html");
   });
   server.on("/settings.js", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(LittleFS, "/settings.js", "application/javascript");
+    request->send(SPIFFS, "/settings.js", "application/javascript");
   });
   
   // JSON API endpoint для получения данных
@@ -53,10 +54,28 @@ void startWebServer() {
     // Оптимизировано с 512 до 384 для экономии памяти
     StaticJsonDocument<640> doc;
     
+    // Получаем актуальный IP адрес
+    String currentIP = deviceIP;
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    
+    // Если WiFi подключен, приоритет у localIP
+    if (wifiConnected) {
+      IPAddress localIP = WiFi.localIP();
+      if (localIP.toString() != "0.0.0.0") {
+        currentIP = localIP.toString();
+      }
+    } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+      // Если в режиме AP, используем softAPIP
+      IPAddress apIP = WiFi.softAPIP();
+      if (apIP.toString() != "0.0.0.0") {
+        currentIP = apIP.toString();
+      }
+    }
+    
     doc["temperature"] = currentTemp;
-    doc["ip"] = deviceIP;
+    doc["ip"] = currentIP;
     doc["uptime"] = deviceUptime;
-    doc["wifi_status"] = WiFi.status() == WL_CONNECTED ? "connected" : "disconnected";
+    doc["wifi_status"] = wifiConnected ? "connected" : "disconnected";
     doc["wifi_rssi"] = wifiRSSI;
     doc["display_screen"] = displayScreen;
     doc["wifi_connected_seconds"] = wifiConnectedSeconds;
@@ -244,15 +263,29 @@ void startWebServer() {
   });
   
   // API для сохранения настроек
-  server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+  static String settingsRequestBody = "";
+  server.on("/api/settings", HTTP_POST, 
+    [](AsyncWebServerRequest *request){
+      // Начало запроса - очищаем буфер
+      settingsRequestBody = "";
+    }, 
+    NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      String body = String((char*)data);
-      body = body.substring(0, len);
+      // Добавляем данные к буферу
+      settingsRequestBody += String((char*)data).substring(0, len);
       
-      if (saveSettings(body)) {
-        request->send(200, "application/json", "{\"status\":\"ok\"}");
-      } else {
-        request->send(500, "application/json", "{\"status\":\"error\"}");
+      // Если это последний фрагмент, обрабатываем
+      if (index + len >= total) {
+        yield(); // Даем время другим задачам
+        
+        if (saveSettings(settingsRequestBody)) {
+          request->send(200, "application/json", "{\"status\":\"ok\"}");
+        } else {
+          request->send(500, "application/json", "{\"status\":\"error\"}");
+        }
+        
+        // Очищаем буфер после обработки
+        settingsRequestBody = "";
       }
     });
   
@@ -288,19 +321,27 @@ void startWebServer() {
   });
   
   // API для сохранения списка термометров
-  server.on("/api/sensors", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+  static String sensorsRequestBody = "";
+  server.on("/api/sensors", HTTP_POST, 
+    [](AsyncWebServerRequest *request){
+      sensorsRequestBody = "";
+    }, 
+    NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      String body = String((char*)data);
-      body = body.substring(0, len);
+      sensorsRequestBody += String((char*)data).substring(0, len);
       
-      StaticJsonDocument<768> doc;
-      DeserializationError error = deserializeJson(doc, body);
-      
-      if (!error && doc.containsKey("sensors")) {
-        // TODO: Сохранять в файл настроек
-        request->send(200, "application/json", "{\"status\":\"ok\"}");
-      } else {
-        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      if (index + len >= total) {
+        StaticJsonDocument<768> doc;
+        DeserializationError error = deserializeJson(doc, sensorsRequestBody);
+        
+        if (!error && doc.containsKey("sensors")) {
+          // TODO: Сохранять в файл настроек
+          request->send(200, "application/json", "{\"status\":\"ok\"}");
+        } else {
+          request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        }
+        
+        sensorsRequestBody = "";
       }
     });
   
@@ -331,22 +372,30 @@ void startWebServer() {
   });
   
   // API для сохранения настроек конкретного термометра
-  server.on("^/api/sensor/([0-9]+)$", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+  static String sensorRequestBody = "";
+  server.on("^/api/sensor/([0-9]+)$", HTTP_POST, 
+    [](AsyncWebServerRequest *request){
+      sensorRequestBody = "";
+    }, 
+    NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      String body = String((char*)data);
-      body = body.substring(0, len);
+      sensorRequestBody += String((char*)data).substring(0, len);
       
-      String sensorId = request->pathArg(0);
-      int id = sensorId.toInt();
-      
-      StaticJsonDocument<512> doc;
-      DeserializationError error = deserializeJson(doc, body);
-      
-      if (!error) {
-        // TODO: Сохранять настройки термометра в файл настроек
-        request->send(200, "application/json", "{\"status\":\"ok\"}");
-      } else {
-        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      if (index + len >= total) {
+        String sensorId = request->pathArg(0);
+        int id = sensorId.toInt();
+        
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, sensorRequestBody);
+        
+        if (!error) {
+          // TODO: Сохранять настройки термометра в файл настроек
+          request->send(200, "application/json", "{\"status\":\"ok\"}");
+        } else {
+          request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        }
+        
+        sensorRequestBody = "";
       }
     });
   
@@ -375,59 +424,115 @@ void startWebServer() {
   });
   
   // API для сохранения режима работы
-  server.on("/api/mode", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+  static String modeRequestBody = "";
+  server.on("/api/mode", HTTP_POST, 
+    [](AsyncWebServerRequest *request){
+      modeRequestBody = "";
+    }, 
+    NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      String body = String((char*)data);
-      body = body.substring(0, len);
+      modeRequestBody += String((char*)data).substring(0, len);
       
-      StaticJsonDocument<256> doc;
-      DeserializationError error = deserializeJson(doc, body);
-      
-      if (!error && doc.containsKey("mode")) {
-        int mode = doc["mode"];
-        setOperationMode((OperationMode)mode);
+      if (index + len >= total) {
+        yield(); // Даем время другим задачам
         
-        if (mode == MODE_ALERT && doc.containsKey("alert")) {
-          float minTemp = doc["alert"]["min_temp"] | 10.0;
-          float maxTemp = doc["alert"]["max_temp"] | 30.0;
-          bool buzzerEnabled = doc["alert"]["buzzer_enabled"] | true;
-          setAlertSettings(minTemp, maxTemp, buzzerEnabled);
-        } else if (mode == MODE_STABILIZATION && doc.containsKey("stabilization")) {
-          float targetTemp = doc["stabilization"]["target_temp"] | 25.0;
-          float tolerance = doc["stabilization"]["tolerance"] | 0.1;
-          float alertThreshold = doc["stabilization"]["alert_threshold"] | 0.2;
-          unsigned long duration = doc["stabilization"]["duration"] | 600;
-          setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, modeRequestBody);
+        
+        if (!error && doc.containsKey("mode")) {
+          int mode = doc["mode"];
+          setOperationMode((OperationMode)mode);
+          yield();
+          
+          if (mode == MODE_ALERT && doc.containsKey("alert")) {
+            float minTemp = doc["alert"]["min_temp"] | 10.0;
+            float maxTemp = doc["alert"]["max_temp"] | 30.0;
+            bool buzzerEnabled = doc["alert"]["buzzer_enabled"] | true;
+            setAlertSettings(minTemp, maxTemp, buzzerEnabled);
+            yield();
+          } else if (mode == MODE_STABILIZATION && doc.containsKey("stabilization")) {
+            float targetTemp = doc["stabilization"]["target_temp"] | 25.0;
+            float tolerance = doc["stabilization"]["tolerance"] | 0.1;
+            float alertThreshold = doc["stabilization"]["alert_threshold"] | 0.2;
+            unsigned long duration = doc["stabilization"]["duration"] | 600;
+            setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+            yield();
+          }
+          
+          request->send(200, "application/json", "{\"status\":\"ok\"}");
+        } else {
+          request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         }
         
-        request->send(200, "application/json", "{\"status\":\"ok\"}");
-      } else {
-        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        modeRequestBody = "";
       }
     });
   
   // API для подключения к Wi-Fi
-  server.on("/api/wifi/connect", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
+  static String wifiConnectRequestBody = "";
+  server.on("/api/wifi/connect", HTTP_POST, 
+    [](AsyncWebServerRequest *request){
+      wifiConnectRequestBody = "";
+    }, 
+    NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      String body = String((char*)data);
-      body = body.substring(0, len);
+      wifiConnectRequestBody += String((char*)data).substring(0, len);
       
-      StaticJsonDocument<256> doc;
-      deserializeJson(doc, body);
-      
-      String ssid = doc["ssid"] | "";
-      String password = doc["password"] | "";
-      
-      if (ssid.length() > 0) {
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_STA);
-        WiFi.setAutoReconnect(true);
-        WiFi.begin(ssid.c_str(), password.c_str());
-        request->send(200, "application/json", "{\"status\":\"connecting\"}");
-      } else {
-        request->send(400, "application/json", "{\"status\":\"invalid\"}");
+      if (index + len >= total) {
+        yield(); // Даем время другим задачам
+        
+        StaticJsonDocument<256> doc;
+        deserializeJson(doc, wifiConnectRequestBody);
+        
+        String ssid = doc["ssid"] | "";
+        String password = doc["password"] | "";
+        
+        if (ssid.length() > 0) {
+          WiFi.disconnect(true);
+          WiFi.mode(WIFI_STA);
+          WiFi.setAutoReconnect(true);
+          WiFi.begin(ssid.c_str(), password.c_str());
+          yield(); // Даем время после операций WiFi
+          request->send(200, "application/json", "{\"status\":\"connecting\"}");
+        } else {
+          request->send(400, "application/json", "{\"status\":\"invalid\"}");
+        }
+        
+        wifiConnectRequestBody = "";
       }
     });
+  
+  // API для отправки тестового сообщения в Telegram
+  server.on("/api/telegram/test", HTTP_POST, [](AsyncWebServerRequest *request){
+    yield(); // Даем время другим задачам
+    
+    // Проверяем подключение WiFi
+    if (WiFi.status() != WL_CONNECTED) {
+      request->send(500, "application/json", "{\"status\":\"error\",\"message\":\"WiFi not connected\"}");
+      return;
+    }
+    
+    yield();
+    bool success = sendTelegramTestMessage();
+    yield(); // Даем время после отправки
+    
+    if (success) {
+      request->send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Test message sent\"}");
+    } else {
+      request->send(500, "application/json", "{\"status\":\"error\",\"message\":\"Failed to send test message\"}");
+    }
+  });
+  
+  // API для отправки тестового сообщения в MQTT
+  server.on("/api/mqtt/test", HTTP_POST, [](AsyncWebServerRequest *request){
+    yield();
+    bool success = sendMqttTestMessage();
+    if (success) {
+      request->send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Test message sent\"}");
+    } else {
+      request->send(500, "application/json", "{\"status\":\"error\",\"message\":\"Failed to send test message\"}");
+    }
+  });
   
   // Обработчик для OPTIONS запросов (CORS preflight)
   server.onNotFound([](AsyncWebServerRequest *request){
@@ -452,7 +557,7 @@ void startWebServer() {
 
 // Функция получения настроек из файла
 String getSettings() {
-  File file = LittleFS.open(SETTINGS_FILE, "r");
+  File file = SPIFFS.open(SETTINGS_FILE, "r");
   if (!file) {
     // Возвращаем настройки по умолчанию
     StaticJsonDocument<768> doc;
@@ -512,63 +617,274 @@ String getSettings() {
 
 // Функция сохранения настроек в файл
 bool saveSettings(String json) {
-  StaticJsonDocument<768> doc;
-  DeserializationError error = deserializeJson(doc, json);
+  yield(); // Даем время другим задачам перед началом обработки
+  
+  // Загружаем существующие настройки из файла
+  StaticJsonDocument<768> existingDoc;
+  String existingContent = "";
+  File existingFile = SPIFFS.open(SETTINGS_FILE, "r");
+  if (existingFile) {
+    existingContent = existingFile.readString();
+    existingFile.close();
+    if (existingContent.length() > 0) {
+      deserializeJson(existingDoc, existingContent);
+    }
+  }
+  
+  yield(); // Даем время после чтения файла
+  
+  // Парсим новые настройки из запроса
+  StaticJsonDocument<768> newDoc;
+  DeserializationError error = deserializeJson(newDoc, json);
   if (error) {
     Serial.println(F("Failed to parse settings JSON"));
     return false;
   }
   
-  // Применяем настройки
-  if (doc["timezone"].containsKey("offset")) {
-    int offset = doc["timezone"]["offset"];
-    setTimezone(offset);
-  }
-  if (doc.containsKey("operation_mode")) {
-    int mode = doc["operation_mode"];
-    setOperationMode((OperationMode)mode);
-  }
-  if (doc.containsKey("telegram")) {
-    String token = doc["telegram"]["bot_token"] | "";
-    String chatId = doc["telegram"]["chat_id"] | "";
-    if (token.length() > 0 || chatId.length() > 0) {
-      setTelegramConfig(token, chatId);
+  yield(); // Даем время после парсинга JSON
+  
+  // Объединяем настройки: сначала копируем существующие, затем перезаписываем новыми
+  StaticJsonDocument<768> mergedDoc;
+  
+  // Копируем весь существующий документ через сериализацию/десериализацию для глубокого копирования
+  if (existingContent.length() > 0 && existingContent != "null") {
+    DeserializationError existingError = deserializeJson(mergedDoc, existingContent);
+    if (existingError) {
+      // Если ошибка парсинга существующего файла, начинаем с пустого документа
+      Serial.println(F("Failed to parse existing settings, starting fresh"));
     }
   }
-  if (doc.containsKey("mqtt")) {
-    String server = doc["mqtt"]["server"] | "";
-    int port = doc["mqtt"]["port"] | 1883;
-    String user = doc["mqtt"]["user"] | "";
-    String password = doc["mqtt"]["password"] | "";
-    String topicStatus = doc["mqtt"]["topic_status"] | "home/thermo/status";
-    String topicControl = doc["mqtt"]["topic_control"] | "home/thermo/control";
-    String security = doc["mqtt"]["security"] | "none";
-    setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
+  
+  // Если файл был пустой или не удалось распарсить, инициализируем значениями по умолчанию
+  if (!mergedDoc.containsKey("wifi")) {
+    mergedDoc["wifi"]["ssid"] = "";
+    mergedDoc["wifi"]["password"] = "";
   }
-  if (doc.containsKey("alert")) {
-    float minTemp = doc["alert"]["min_temp"] | 10.0;
-    float maxTemp = doc["alert"]["max_temp"] | 30.0;
-    bool buzzerEnabled = doc["alert"]["buzzer_enabled"] | true;
-    setAlertSettings(minTemp, maxTemp, buzzerEnabled);
+  if (!mergedDoc.containsKey("mqtt")) {
+    mergedDoc["mqtt"]["server"] = "";
+    mergedDoc["mqtt"]["port"] = 1883;
+    mergedDoc["mqtt"]["user"] = "";
+    mergedDoc["mqtt"]["password"] = "";
+    mergedDoc["mqtt"]["topic_status"] = "home/thermo/status";
+    mergedDoc["mqtt"]["topic_control"] = "home/thermo/control";
+    mergedDoc["mqtt"]["security"] = "none";
   }
-  if (doc.containsKey("stabilization")) {
-    float targetTemp = doc["stabilization"]["target_temp"] | 25.0;
-    float tolerance = doc["stabilization"]["tolerance"] | 0.1;
-    float alertThreshold = doc["stabilization"]["alert_threshold"] | 0.2;
-    unsigned long duration = doc["stabilization"]["duration"] | 600;
-    setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+  if (!mergedDoc.containsKey("telegram")) {
+    mergedDoc["telegram"]["bot_token"] = "";
+    mergedDoc["telegram"]["chat_id"] = "";
+  }
+  if (!mergedDoc.containsKey("temperature")) {
+    mergedDoc["temperature"]["high_threshold"] = 30.0;
+    mergedDoc["temperature"]["low_threshold"] = 10.0;
+  }
+  if (!mergedDoc.containsKey("timezone")) {
+    mergedDoc["timezone"]["offset"] = 3;
+  }
+  if (!mergedDoc.containsKey("operation_mode")) {
+    mergedDoc["operation_mode"] = 0;
+  }
+  if (!mergedDoc.containsKey("alert")) {
+    mergedDoc["alert"]["min_temp"] = 10.0;
+    mergedDoc["alert"]["max_temp"] = 30.0;
+    mergedDoc["alert"]["buzzer_enabled"] = true;
+  }
+  if (!mergedDoc.containsKey("stabilization")) {
+    mergedDoc["stabilization"]["target_temp"] = 25.0;
+    mergedDoc["stabilization"]["tolerance"] = 0.1;
+    mergedDoc["stabilization"]["alert_threshold"] = 0.2;
+    mergedDoc["stabilization"]["duration"] = 600;
   }
   
-  File file = LittleFS.open(SETTINGS_FILE, "w");
+  // Перезаписываем только те секции, которые есть в новом запросе (частичное обновление)
+  if (newDoc.containsKey("wifi")) {
+    // Обновляем только поля WiFi, которые есть в новом запросе
+    if (newDoc["wifi"].containsKey("ssid")) {
+      mergedDoc["wifi"]["ssid"] = newDoc["wifi"]["ssid"];
+    }
+    if (newDoc["wifi"].containsKey("password")) {
+      mergedDoc["wifi"]["password"] = newDoc["wifi"]["password"];
+    }
+  }
+  
+  if (newDoc.containsKey("telegram")) {
+    // Обновляем только поля Telegram, которые есть в новом запросе
+    if (newDoc["telegram"].containsKey("bot_token")) {
+      mergedDoc["telegram"]["bot_token"] = newDoc["telegram"]["bot_token"];
+    }
+    if (newDoc["telegram"].containsKey("chat_id")) {
+      mergedDoc["telegram"]["chat_id"] = newDoc["telegram"]["chat_id"];
+    }
+  }
+  
+  if (newDoc.containsKey("mqtt")) {
+    // Обновляем только поля MQTT, которые есть в новом запросе
+    if (newDoc["mqtt"].containsKey("server")) {
+      String server = newDoc["mqtt"]["server"] | "";
+      server.trim();
+      if (server == "#" || server == "null" || server.length() == 0) {
+        mergedDoc["mqtt"]["server"] = "";
+      } else {
+        mergedDoc["mqtt"]["server"] = server;
+      }
+    }
+    if (newDoc["mqtt"].containsKey("port")) {
+      mergedDoc["mqtt"]["port"] = newDoc["mqtt"]["port"];
+    }
+    if (newDoc["mqtt"].containsKey("user")) {
+      mergedDoc["mqtt"]["user"] = newDoc["mqtt"]["user"];
+    }
+    if (newDoc["mqtt"].containsKey("password")) {
+      mergedDoc["mqtt"]["password"] = newDoc["mqtt"]["password"];
+    }
+    if (newDoc["mqtt"].containsKey("topic_status")) {
+      mergedDoc["mqtt"]["topic_status"] = newDoc["mqtt"]["topic_status"];
+    }
+    if (newDoc["mqtt"].containsKey("topic_control")) {
+      mergedDoc["mqtt"]["topic_control"] = newDoc["mqtt"]["topic_control"];
+    }
+    if (newDoc["mqtt"].containsKey("security")) {
+      mergedDoc["mqtt"]["security"] = newDoc["mqtt"]["security"];
+    }
+  }
+  
+  if (newDoc.containsKey("temperature")) {
+    if (newDoc["temperature"].containsKey("high_threshold")) {
+      mergedDoc["temperature"]["high_threshold"] = newDoc["temperature"]["high_threshold"];
+    }
+    if (newDoc["temperature"].containsKey("low_threshold")) {
+      mergedDoc["temperature"]["low_threshold"] = newDoc["temperature"]["low_threshold"];
+    }
+  }
+  
+  if (newDoc.containsKey("timezone")) {
+    if (newDoc["timezone"].containsKey("offset")) {
+      mergedDoc["timezone"]["offset"] = newDoc["timezone"]["offset"];
+    }
+  }
+  
+  if (newDoc.containsKey("operation_mode")) {
+    mergedDoc["operation_mode"] = newDoc["operation_mode"];
+  }
+  
+  if (newDoc.containsKey("alert")) {
+    if (newDoc["alert"].containsKey("min_temp")) {
+      mergedDoc["alert"]["min_temp"] = newDoc["alert"]["min_temp"];
+    }
+    if (newDoc["alert"].containsKey("max_temp")) {
+      mergedDoc["alert"]["max_temp"] = newDoc["alert"]["max_temp"];
+    }
+    if (newDoc["alert"].containsKey("buzzer_enabled")) {
+      mergedDoc["alert"]["buzzer_enabled"] = newDoc["alert"]["buzzer_enabled"];
+    }
+  }
+  
+  if (newDoc.containsKey("stabilization")) {
+    if (newDoc["stabilization"].containsKey("target_temp")) {
+      mergedDoc["stabilization"]["target_temp"] = newDoc["stabilization"]["target_temp"];
+    }
+    if (newDoc["stabilization"].containsKey("tolerance")) {
+      mergedDoc["stabilization"]["tolerance"] = newDoc["stabilization"]["tolerance"];
+    }
+    if (newDoc["stabilization"].containsKey("alert_threshold")) {
+      mergedDoc["stabilization"]["alert_threshold"] = newDoc["stabilization"]["alert_threshold"];
+    }
+    if (newDoc["stabilization"].containsKey("duration")) {
+      mergedDoc["stabilization"]["duration"] = newDoc["stabilization"]["duration"];
+    }
+  }
+  
+  yield(); // Даем время после объединения
+  
+  // Применяем настройки
+  if (mergedDoc["timezone"].containsKey("offset")) {
+    int offset = mergedDoc["timezone"]["offset"];
+    setTimezone(offset);
+    yield();
+  }
+  if (mergedDoc.containsKey("operation_mode")) {
+    int mode = mergedDoc["operation_mode"];
+    setOperationMode((OperationMode)mode);
+    yield();
+  }
+  if (mergedDoc.containsKey("telegram")) {
+    String token = mergedDoc["telegram"]["bot_token"] | "";
+    String chatId = mergedDoc["telegram"]["chat_id"] | "";
+    if (token.length() > 0 || chatId.length() > 0) {
+      setTelegramConfig(token, chatId);
+      yield();
+    }
+  }
+  if (mergedDoc.containsKey("mqtt")) {
+    String server = mergedDoc["mqtt"]["server"] | "";
+    int port = mergedDoc["mqtt"]["port"] | 1883;
+    String user = mergedDoc["mqtt"]["user"] | "";
+    String password = mergedDoc["mqtt"]["password"] | "";
+    String topicStatus = mergedDoc["mqtt"]["topic_status"] | "home/thermo/status";
+    String topicControl = mergedDoc["mqtt"]["topic_control"] | "home/thermo/control";
+    String security = mergedDoc["mqtt"]["security"] | "none";
+    setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
+    yield();
+  }
+  if (mergedDoc.containsKey("alert")) {
+    float minTemp = mergedDoc["alert"]["min_temp"] | 10.0;
+    float maxTemp = mergedDoc["alert"]["max_temp"] | 30.0;
+    bool buzzerEnabled = mergedDoc["alert"]["buzzer_enabled"] | true;
+    setAlertSettings(minTemp, maxTemp, buzzerEnabled);
+    yield();
+  }
+  if (mergedDoc.containsKey("stabilization")) {
+    float targetTemp = mergedDoc["stabilization"]["target_temp"] | 25.0;
+    float tolerance = mergedDoc["stabilization"]["tolerance"] | 0.1;
+    float alertThreshold = mergedDoc["stabilization"]["alert_threshold"] | 0.2;
+    unsigned long duration = mergedDoc["stabilization"]["duration"] | 600;
+    setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+    yield();
+  }
+  
+  yield(); // Даем время перед записью в файл
+  
+  // Сохраняем объединенные настройки
+  File file = SPIFFS.open(SETTINGS_FILE, "w");
   if (!file) {
     Serial.println(F("Failed to open settings file for writing"));
     return false;
   }
   
   String output;
-  serializeJson(doc, output);
-  file.print(output);
+  serializeJson(mergedDoc, output);
+  
+  size_t bytesWritten = file.print(output);
+  file.flush(); // Принудительно записываем данные на диск
   file.close();
-  Serial.println(F("Settings saved"));
+  
+  yield(); // Даем время после записи в файл
+  
+  // Логируем для отладки
+  Serial.print(F("Settings saved. Size: "));
+  Serial.print(output.length());
+  Serial.print(F(" bytes, Written: "));
+  Serial.println(bytesWritten);
+  
+  // Проверяем, что файл действительно записался
+  delay(100); // Небольшая задержка для завершения записи
+  yield();
+  
+  File verifyFile = SPIFFS.open(SETTINGS_FILE, "r");
+  if (verifyFile) {
+    String verifyContent = verifyFile.readString();
+    verifyFile.close();
+    if (verifyContent.length() > 0 && verifyContent == output) {
+      Serial.println(F("Settings file verified successfully"));
+    } else {
+      Serial.println(F("WARNING: Settings file verification failed!"));
+      Serial.print(F("Expected length: "));
+      Serial.print(output.length());
+      Serial.print(F(", Got length: "));
+      Serial.println(verifyContent.length());
+    }
+  } else {
+    Serial.println(F("WARNING: Could not verify settings file!"));
+  }
+  
   return true;
 }

@@ -12,5 +12,7 @@ bool isTelegramInitialized();
 bool isTelegramPollOk();
 unsigned long getTelegramLastPollMs();
 void sendTemperatureAlert(float temperature);
+bool sendTelegramTestMessage();
+void processTelegramQueue(); // Обработка очереди сообщений (вызывать из loop())
 
 #endif

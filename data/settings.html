@@ -261,7 +261,6 @@
             <button class="tab-button active" onclick="showTab('wifi')">📶 Wi-Fi</button>
             <button class="tab-button" onclick="showTab('mqtt')">📡 MQTT</button>
             <button class="tab-button" onclick="showTab('telegram')">💬 Telegram</button>
-            <button class="tab-button" onclick="showTab('temperature')">🌡️ Температура</button>
             <button class="tab-button" onclick="showTab('timezone')">🕐 Часовой пояс</button>
             <button class="tab-button" onclick="showTab('sensors')">🌡️ Термометры</button>
         </div>
@@ -337,6 +336,12 @@
                     <label>Статус MQTT</label>
                     <div id="mqtt-status-settings" class="status-detail">--</div>
                 </div>
+
+                <div class="form-group">
+                    <label>Тестирование</label>
+                    <button type="button" class="btn btn-secondary" onclick="sendMqttTest()" style="margin-top: 10px;">📤 Отправить тестовое сообщение</button>
+                    <small>Отправит тестовое сообщение в MQTT для проверки подключения</small>
+                </div>
                 
                 <div class="button-group">
                     <button type="button" class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
@@ -365,28 +370,11 @@
                     <label>Статус Telegram</label>
                     <div id="telegram-status-settings" class="status-detail">--</div>
                 </div>
-                
-                <div class="button-group">
-                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
-                    <button type="button" class="btn btn-secondary" onclick="loadSettings()">Отмена</button>
-                </div>
-            </form>
-        </div>
-        
-        <!-- Настройки температуры -->
-        <div id="temperature-tab" class="tab-content">
-            <h2>Настройки температуры</h2>
-            <form id="temperature-form">
+
                 <div class="form-group">
-                    <label for="temp-high">Верхний порог (°C)</label>
-                    <input type="number" id="temp-high" name="high_threshold" step="0.1" value="30.0">
-                    <small>Уведомление при превышении этого значения</small>
-                </div>
-                
-                <div class="form-group">
-                    <label for="temp-low">Нижний порог (°C)</label>
-                    <input type="number" id="temp-low" name="low_threshold" step="0.1" value="10.0">
-                    <small>Уведомление при падении ниже этого значения</small>
+                    <label>Тестирование</label>
+                    <button type="button" class="btn btn-secondary" onclick="sendTelegramTest()" style="margin-top: 10px;">📤 Отправить тестовое сообщение</button>
+                    <small>Отправит тестовое сообщение в Telegram для проверки подключения</small>
                 </div>
                 
                 <div class="button-group">
