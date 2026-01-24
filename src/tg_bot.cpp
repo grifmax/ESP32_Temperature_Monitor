@@ -12,11 +12,14 @@
 #include "mqtt_client.h"
 #include "operation_modes.h"
 #include "web_server.h"
+#include "display.h"
+#include "buzzer.h"
 
 extern float currentTemp;
 extern unsigned long deviceUptime;
 extern String deviceIP;
 extern int wifiRSSI;
+extern int displayScreen;
 
 WiFiClientSecure secured_client;
 UniversalTelegramBot* bot = nullptr;
@@ -93,6 +96,11 @@ static void sendTelegramMessageToQueue(const String& chatId, const String& messa
   if (xQueueSend(telegramQueue, &msg, 0) != pdTRUE) {
     delete msg; // Очередь переполнена
     Serial.println(F("Telegram queue is full, message dropped"));
+  } else {
+    Serial.print(F("Message queued for chat: "));
+    Serial.print(chatId);
+    Serial.print(F(", length: "));
+    Serial.println(message.length());
   }
 }
 
@@ -136,16 +144,30 @@ void processTelegramQueue() {
     Serial.print(F(", length: "));
     Serial.println(msg->message.length());
     
-    bool success = bot->sendMessage(msg->chatId, msg->message, "");
+    // Используем Markdown для форматирования сообщений
+    // Если Markdown не работает, можно попробовать "HTML" или убрать форматирование ""
+    String parseMode = "Markdown";
+    bool success = bot->sendMessage(msg->chatId, msg->message, parseMode);
     
     if (msg->isTestMessage) {
       if (success) {
         Serial.println(F("Telegram test message sent successfully"));
       } else {
         Serial.println(F("Telegram test message failed - check bot token and chat ID"));
+        // Попробуем отправить без форматирования
+        Serial.println(F("Trying to send without formatting..."));
+        success = bot->sendMessage(msg->chatId, msg->message, "");
+        Serial.println(success ? F("Message sent without formatting") : F("Still failed"));
       }
     } else {
-      Serial.println(success ? F("Telegram message sent") : F("Telegram message failed"));
+      if (success) {
+        Serial.println(F("Telegram message sent"));
+      } else {
+        Serial.println(F("Telegram message failed - trying without formatting..."));
+        // Попробуем отправить без форматирования, если Markdown не работает
+        success = bot->sendMessage(msg->chatId, msg->message, "");
+        Serial.println(success ? F("Message sent without formatting") : F("Still failed"));
+      }
     }
     
     delete msg;
@@ -173,42 +195,106 @@ void handleTelegramMessages() {
     return;
   }
 
-  // Используем long poll для уменьшения количества запросов
-  // 0 означает короткий poll, но мы вызываем функцию реже
-  int numNewMessages = bot->getUpdates(0);
+  // Используем offset для получения только новых сообщений
+  // last_message_received содержит ID последнего обработанного сообщения
+  // Передаем last_message_received + 1, чтобы получить только новые сообщения
+  int numNewMessages = bot->getUpdates(bot->last_message_received + 1);
   telegramLastPollMs = millis();
   telegramLastPollOk = (numNewMessages >= 0);
-  if (numNewMessages <= 0) {
+  
+  if (numNewMessages < 0) {
+    Serial.println(F("Telegram getUpdates error"));
     return;
   }
+  
+  if (numNewMessages == 0) {
+    // Нет новых сообщений - это нормально
+    return;
+  }
+  
+  Serial.print(F("Telegram: received "));
+  Serial.print(numNewMessages);
+  Serial.print(F(" new message(s), last_update_id: "));
+  Serial.println(bot->last_message_received);
 
   for (int i = 0; i < numNewMessages; i++) {
-    String text = bot->messages[i].text;
+    String originalText = bot->messages[i].text;
     String chat_id = String(bot->messages[i].chat_id);
     
-    // Приводим команду к нижнему регистру для удобства
-    text.toLowerCase();
-    text.trim();
+    // Отладочный вывод
+    Serial.print(F("Telegram message received: "));
+    Serial.print(originalText);
+    Serial.print(F(" from chat: "));
+    Serial.println(chat_id);
     
-    if (text == "/start" || text == "/help") {
+    // Обработка команды с именем бота (например /start@botname)
+    String text = originalText;
+    int atIndex = text.indexOf('@');
+    if (atIndex > 0) {
+      text = text.substring(0, atIndex);
+    }
+    
+    // Обработка команды с параметрами (берем только первую часть до пробела)
+    int spaceIndex = text.indexOf(' ');
+    String command = text;
+    if (spaceIndex > 0) {
+      command = text.substring(0, spaceIndex);
+    }
+    
+    // Приводим команду к нижнему регистру для удобства
+    command.toLowerCase();
+    command.trim();
+    
+    // Добавляем слэш, если его нет (для удобства пользователя)
+    if (command.length() > 0 && command.charAt(0) != '/') {
+      command = "/" + command;
+    }
+    
+    Serial.print(F("Processing command: "));
+    Serial.println(command);
+    
+    if (command == "/start" || command == "/help" || command == "help" || command == "start") {
+      Serial.println(F("Command /start or /help recognized, sending response..."));
       String message = "🌡️ *ESP32 Temperature Monitor*\n\n";
-      message += "📋 *Доступные команды:*\n\n";
+      message += "📋 *Информационные команды:*\n";
       message += "🔹 `/status` - текущий статус устройства\n";
       message += "🔹 `/temp` - текущая температура\n";
       message += "🔹 `/sensors` - список всех датчиков\n";
       message += "🔹 `/info` - подробная информация\n";
       message += "🔹 `/mode` - текущий режим работы\n";
       message += "🔹 `/wifi` - информация о WiFi\n";
-      message += "🔹 `/mqtt` - статус MQTT\n";
+      message += "🔹 `/mqtt` - статус MQTT\n\n";
+      message += "⚙️ *Команды управления режимами:*\n";
+      message += "🔹 `/mode_local` - локальный режим\n";
+      message += "🔹 `/mode_monitoring` - режим мониторинга\n";
+      message += "🔹 `/mode_alert` - режим оповещения\n";
+      message += "🔹 `/mode_stabilization` - режим стабилизации\n\n";
+      message += "🔔 *Настройка оповещений:*\n";
+      message += "🔹 `/alert_set <min> <max> [buzzer]` - установить пороги\n";
+      message += "   Пример: `/alert_set 10 30 1`\n";
+      message += "🔹 `/alert_get` - текущие настройки\n\n";
+      message += "🎯 *Настройка стабилизации:*\n";
+      message += "🔹 `/stab_set <target> [tolerance] [alert] [duration]`\n";
+      message += "   Пример: `/stab_set 25 0.1 0.2 600`\n";
+      message += "🔹 `/stab_get` - текущие настройки\n\n";
+      message += "📺 *Управление дисплеем:*\n";
+      message += "🔹 `/display_on` - включить дисплей\n";
+      message += "🔹 `/display_off` - выключить дисплей\n";
+      message += "🔹 `/display_temp` - показать температуру\n";
+      message += "🔹 `/display_info` - показать информацию\n\n";
+      message += "🔊 *Управление зуммером:*\n";
+      message += "🔹 `/buzzer_test` - тест зуммера\n\n";
+      message += "🛠️ *Системные команды:*\n";
+      message += "🔹 `/reboot` - перезагрузить устройство\n";
       message += "🔹 `/help` - эта справка\n";
       
       sendTelegramMessageToQueue(chat_id, message);
       
-    } else if (text == "/status" || text == "/temp") {
+    } else if (command == "/status" || command == "/temp" || command == "status" || command == "temp") {
       String message = "🌡️ *Температура:* " + String(currentTemp, 1) + "°C";
       sendTelegramMessageToQueue(chat_id, message);
       
-    } else if (text == "/sensors") {
+    } else if (command == "/sensors" || command == "sensors") {
       String message = "🌡️ *Датчики температуры*\n\n";
       
       // Получаем информацию о датчиках через API
@@ -220,7 +306,7 @@ void handleTelegramMessages() {
       
       sendTelegramMessageToQueue(chat_id, message);
       
-    } else if (text == "/info") {
+    } else if (command == "/info" || command == "info") {
       unsigned long hours = deviceUptime / 3600;
       unsigned long minutes = (deviceUptime % 3600) / 60;
       unsigned long seconds = deviceUptime % 60;
@@ -242,7 +328,7 @@ void handleTelegramMessages() {
       
       sendTelegramMessageToQueue(chat_id, message);
       
-    } else if (text == "/mode") {
+    } else if (command == "/mode" || command == "mode") {
       OperationMode mode = getOperationMode();
       const char* modeNames[] = {"Локальный", "Мониторинг", "Оповещение", "Стабилизация"};
       const char* modeDescs[] = {
@@ -274,7 +360,7 @@ void handleTelegramMessages() {
       
       sendTelegramMessageToQueue(chat_id, message);
       
-    } else if (text == "/wifi") {
+    } else if (command == "/wifi" || command == "wifi") {
       String message = "📶 *Информация о WiFi*\n\n";
       
       if (WiFi.status() == WL_CONNECTED) {
@@ -291,7 +377,7 @@ void handleTelegramMessages() {
       
       sendTelegramMessageToQueue(chat_id, message);
       
-    } else if (text == "/mqtt") {
+    } else if (command == "/mqtt" || command == "mqtt") {
       String message = "📨 *Статус MQTT*\n\n";
       
       if (isMqttConfigured()) {
@@ -305,9 +391,199 @@ void handleTelegramMessages() {
       
       sendTelegramMessageToQueue(chat_id, message);
       
+    } else if (command.startsWith("/mode_local") || command == "mode_local") {
+      setOperationMode(MODE_LOCAL);
+      String message = "✅ *Режим изменен*\n\n";
+      message += "📌 *Новый режим:* Локальный\n";
+      message += "📝 *Описание:* Только локальный мониторинг, WiFi только при нажатии кнопки";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command.startsWith("/mode_monitoring") || command == "mode_monitoring") {
+      setOperationMode(MODE_MONITORING);
+      String message = "✅ *Режим изменен*\n\n";
+      message += "📌 *Новый режим:* Мониторинг\n";
+      message += "📝 *Описание:* Мониторинг с отправкой в MQTT и Telegram";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command.startsWith("/mode_alert") || command == "mode_alert") {
+      setOperationMode(MODE_ALERT);
+      String message = "✅ *Режим изменен*\n\n";
+      message += "📌 *Новый режим:* Оповещение\n";
+      message += "📝 *Описание:* Режим оповещения при превышении порогов";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command.startsWith("/mode_stabilization") || command == "mode_stabilization") {
+      setOperationMode(MODE_STABILIZATION);
+      String message = "✅ *Режим изменен*\n\n";
+      message += "📌 *Новый режим:* Стабилизация\n";
+      message += "📝 *Описание:* Режим стабилизации температуры\n\n";
+      message += "💡 Используйте `/stab_set` для настройки параметров";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command.startsWith("/alert_set") || command == "alert_set") {
+      // Парсинг команды: /alert_set <min> <max> [buzzer]
+      // Используем оригинальный text для получения параметров (после удаления @botname)
+      int firstSpace = text.indexOf(' ');
+      if (firstSpace == -1) {
+        String message = "❌ *Ошибка формата*\n\n";
+        message += "Использование: `/alert_set <min> <max> [buzzer]`\n";
+        message += "Пример: `/alert_set 10 30 1`\n";
+        message += "buzzer: 1 - включен, 0 - выключен (по умолчанию 1)";
+        sendTelegramMessageToQueue(chat_id, message);
+      } else {
+        String params = text.substring(firstSpace + 1);
+        int secondSpace = params.indexOf(' ');
+        int thirdSpace = params.indexOf(' ', secondSpace + 1);
+        
+        if (secondSpace == -1) {
+          String message = "❌ *Ошибка формата*\n\n";
+          message += "Использование: `/alert_set <min> <max> [buzzer]`";
+          sendTelegramMessageToQueue(chat_id, message);
+        } else {
+          float minTemp = params.substring(0, secondSpace).toFloat();
+          float maxTemp = params.substring(secondSpace + 1, thirdSpace > 0 ? thirdSpace : params.length()).toFloat();
+          bool buzzerEnabled = true;
+          
+          if (thirdSpace > 0) {
+            String buzzerStr = params.substring(thirdSpace + 1);
+            buzzerEnabled = (buzzerStr.toInt() == 1);
+          }
+          
+          if (minTemp >= maxTemp) {
+            String message = "❌ *Ошибка*\n\n";
+            message += "Минимальная температура должна быть меньше максимальной!";
+            sendTelegramMessageToQueue(chat_id, message);
+          } else {
+            setAlertSettings(minTemp, maxTemp, buzzerEnabled);
+            String message = "✅ *Настройки оповещения обновлены*\n\n";
+            message += "🔔 *Минимальная температура:* " + String(minTemp, 1) + "°C\n";
+            message += "🔔 *Максимальная температура:* " + String(maxTemp, 1) + "°C\n";
+            message += "🔊 *Зуммер:* " + String(buzzerEnabled ? "✅ Включен" : "❌ Выключен");
+            sendTelegramMessageToQueue(chat_id, message);
+          }
+        }
+      }
+      
+    } else if (command == "/alert_get" || command == "alert_get") {
+      AlertModeSettings alert = getAlertSettings();
+      String message = "🔔 *Настройки оповещения*\n\n";
+      message += "📉 *Минимальная температура:* " + String(alert.minTemp, 1) + "°C\n";
+      message += "📈 *Максимальная температура:* " + String(alert.maxTemp, 1) + "°C\n";
+      message += "🔊 *Зуммер:* " + String(alert.buzzerEnabled ? "✅ Включен" : "❌ Выключен");
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command.startsWith("/stab_set") || command == "stab_set") {
+      // Парсинг команды: /stab_set <target> [tolerance] [alert] [duration]
+      // Используем оригинальный text для получения параметров (после удаления @botname)
+      int firstSpace = text.indexOf(' ');
+      if (firstSpace == -1) {
+        String message = "❌ *Ошибка формата*\n\n";
+        message += "Использование: `/stab_set <target> [tolerance] [alert] [duration]`\n";
+        message += "Пример: `/stab_set 25 0.1 0.2 600`\n\n";
+        message += "Параметры:\n";
+        message += "  target - целевая температура (°C)\n";
+        message += "  tolerance - допуск (по умолчанию 0.1°C)\n";
+        message += "  alert - порог тревоги (по умолчанию 0.2°C)\n";
+        message += "  duration - длительность в секундах (по умолчанию 600)";
+        sendTelegramMessageToQueue(chat_id, message);
+      } else {
+        String params = text.substring(firstSpace + 1);
+        int spaces[4] = {-1, -1, -1, -1};
+        int spaceCount = 0;
+        for (int i = 0; i < params.length() && spaceCount < 3; i++) {
+          if (params.charAt(i) == ' ') {
+            spaces[spaceCount] = i;
+            spaceCount++;
+          }
+        }
+        
+        float targetTemp = params.substring(0, spaces[0] > 0 ? spaces[0] : params.length()).toFloat();
+        float tolerance = 0.1;
+        float alertThreshold = 0.2;
+        unsigned long duration = 600;
+        
+        if (spaces[0] > 0) {
+          tolerance = params.substring(spaces[0] + 1, spaces[1] > 0 ? spaces[1] : params.length()).toFloat();
+        }
+        if (spaces[1] > 0) {
+          alertThreshold = params.substring(spaces[1] + 1, spaces[2] > 0 ? spaces[2] : params.length()).toFloat();
+        }
+        if (spaces[2] > 0) {
+          duration = params.substring(spaces[2] + 1).toInt();
+        }
+        
+        if (targetTemp <= 0 || tolerance <= 0 || alertThreshold <= 0 || duration <= 0) {
+          String message = "❌ *Ошибка*\n\n";
+          message += "Все параметры должны быть положительными числами!";
+          sendTelegramMessageToQueue(chat_id, message);
+        } else {
+          setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+          String message = "✅ *Настройки стабилизации обновлены*\n\n";
+          message += "🎯 *Целевая температура:* " + String(targetTemp, 1) + "°C\n";
+          message += "📏 *Допуск:* ±" + String(tolerance, 2) + "°C\n";
+          message += "⚠️ *Порог тревоги:* " + String(alertThreshold, 2) + "°C\n";
+          message += "⏱️ *Длительность:* " + String(duration) + "с (" + String(duration / 60) + " мин)";
+          sendTelegramMessageToQueue(chat_id, message);
+        }
+      }
+      
+    } else if (command == "/stab_get" || command == "stab_get") {
+      StabilizationModeSettings stab = getStabilizationSettings();
+      String message = "🎯 *Настройки стабилизации*\n\n";
+      message += "📌 *Целевая температура:* " + String(stab.targetTemp, 1) + "°C\n";
+      message += "📏 *Допуск:* ±" + String(stab.tolerance, 2) + "°C\n";
+      message += "⚠️ *Порог тревоги:* " + String(stab.alertThreshold, 2) + "°C\n";
+      message += "⏱️ *Длительность:* " + String(stab.duration) + "с (" + String(stab.duration / 60) + " мин)";
+      
+      if (getOperationMode() == MODE_STABILIZATION) {
+        message += "\n\n📊 *Статус стабилизации:*\n";
+        message += "   Стабилизировано: " + String(isStabilized() ? "✅ Да" : "❌ Нет") + "\n";
+        if (isStabilized()) {
+          message += "   Время: " + String(getStabilizationTime()) + "с";
+        }
+      }
+      
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command == "/display_on" || command == "display_on") {
+      setDisplayScreen(DISPLAY_TEMP);
+      String message = "✅ *Дисплей включен*\n\n";
+      message += "📺 Показывается экран с температурой";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command == "/display_off" || command == "display_off") {
+      turnOffDisplay();
+      String message = "✅ *Дисплей выключен*";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command == "/display_temp" || command == "display_temp") {
+      setDisplayScreen(DISPLAY_TEMP);
+      String message = "✅ *Экран переключен*\n\n";
+      message += "📺 Показывается температура: " + String(currentTemp, 1) + "°C";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command == "/display_info" || command == "display_info") {
+      setDisplayScreen(DISPLAY_INFO);
+      String message = "✅ *Экран переключен*\n\n";
+      message += "📺 Показывается информационный экран";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command == "/buzzer_test" || command == "buzzer_test") {
+      buzzerBeep(BUZZER_SHORT_BEEP);
+      String message = "✅ *Тест зуммера*\n\n";
+      message += "🔊 Зуммер должен был издать короткий сигнал";
+      sendTelegramMessageToQueue(chat_id, message);
+      
+    } else if (command == "/reboot" || command == "reboot") {
+      String message = "🔄 *Перезагрузка устройства*\n\n";
+      message += "Устройство будет перезагружено через 2 секунды...";
+      sendTelegramMessageToQueue(chat_id, message);
+      delay(2000); // Даем время на отправку сообщения
+      ESP.restart();
+      
     } else {
       // Неизвестная команда
-      String message = "❓ Неизвестная команда: `" + text + "`\n\n";
+      String message = "❓ Неизвестная команда: `" + command + "`\n\n";
       message += "Используйте `/help` для списка доступных команд.";
       sendTelegramMessageToQueue(chat_id, message);
     }
