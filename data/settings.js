@@ -282,6 +282,11 @@ async function loadSettings() {
             document.getElementById('mqtt-password').value = settings.mqtt.password || '';
             document.getElementById('mqtt-topic-status').value = settings.mqtt.topic_status || 'home/thermo/status';
             document.getElementById('mqtt-topic-control').value = settings.mqtt.topic_control || 'home/thermo/control';
+            // Проверяем, включен ли MQTT (если сервер не пустой, значит включен)
+            const mqttEnabledCheckbox = document.getElementById('mqtt-enabled');
+            if (mqttEnabledCheckbox) {
+                mqttEnabledCheckbox.checked = (settings.mqtt.server && settings.mqtt.server.length > 0 && settings.mqtt.server !== '#');
+            }
         }
         
         // Заполнить форму Telegram
@@ -295,6 +300,8 @@ async function loadSettings() {
             document.getElementById('timezone-offset').value = settings.timezone.offset || 3;
         }
         
+        // Термометры загружаются отдельно через loadSensors()
+        
     } catch (error) {
         console.error('Error loading settings:', error);
         showMessage('Ошибка загрузки настроек', 'error');
@@ -302,48 +309,128 @@ async function loadSettings() {
 }
 
 // Функция сохранения настроек
-async function saveSettings() {
+async function saveSettings(section) {
     try {
-        const settings = {
-            wifi: {
+        const settings = {};
+        
+        // Сохраняем только указанную секцию или все, если не указано
+        if (!section || section === 'wifi') {
+            settings.wifi = {
                 ssid: document.getElementById('wifi-ssid').value,
                 password: document.getElementById('wifi-password').value
-            },
-            mqtt: {
-                server: document.getElementById('mqtt-server').value,
-                port: parseInt(document.getElementById('mqtt-port').value),
-                security: document.getElementById('mqtt-security').value,
-                user: document.getElementById('mqtt-user').value,
-                password: document.getElementById('mqtt-password').value,
-                topic_status: document.getElementById('mqtt-topic-status').value,
-                topic_control: document.getElementById('mqtt-topic-control').value
-            },
-            telegram: {
+            };
+        }
+        
+        if (!section || section === 'mqtt') {
+            const mqttEnabled = document.getElementById('mqtt-enabled').checked;
+            if (!mqttEnabled) {
+                // Если MQTT отключен, очищаем сервер для принудительного отключения
+                settings.mqtt = {
+                    server: '#', // Специальное значение для отключения
+                    port: 1883,
+                    security: document.getElementById('mqtt-security').value,
+                    user: '',
+                    password: '',
+                    topic_status: document.getElementById('mqtt-topic-status').value,
+                    topic_control: document.getElementById('mqtt-topic-control').value
+                };
+            } else {
+                settings.mqtt = {
+                    server: document.getElementById('mqtt-server').value,
+                    port: parseInt(document.getElementById('mqtt-port').value),
+                    security: document.getElementById('mqtt-security').value,
+                    user: document.getElementById('mqtt-user').value,
+                    password: document.getElementById('mqtt-password').value,
+                    topic_status: document.getElementById('mqtt-topic-status').value,
+                    topic_control: document.getElementById('mqtt-topic-control').value
+                };
+            }
+        }
+        
+        if (!section || section === 'telegram') {
+            settings.telegram = {
                 bot_token: document.getElementById('telegram-bot-token').value,
                 chat_id: document.getElementById('telegram-chat-id').value
-            },
-            timezone: {
-                offset: parseInt(document.getElementById('timezone-offset').value)
-            }
-        };
-        
-        const response = await fetch('/api/settings', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(settings)
-        });
-        
-        if (response.ok) {
-            showMessage('Настройки успешно сохранены', 'success');
-            updateServiceStatus();
-        } else {
-            showMessage('Ошибка сохранения настроек', 'error');
+            };
         }
+        
+        if (!section || section === 'timezone') {
+            settings.timezone = {
+                offset: parseInt(document.getElementById('timezone-offset').value)
+            };
+        }
+        
+        if (!section || section === 'sensors') {
+            // Сохраняем настройки термометров (используем адрес как ключ)
+            // Собираем актуальные значения из полей формы перед сохранением
+            const sensorsToSave = sensors.map((s, idx) => {
+                // Получаем актуальные значения из полей формы
+                const nameInput = document.getElementById(`sensor-name-${idx}`);
+                const modeSelect = document.getElementById(`sensor-mode-${idx}`);
+                const enabledCheckbox = document.getElementById(`sensor-enabled-${idx}`);
+                const correctionInput = document.getElementById(`sensor-correction-${idx}`);
+                
+                return {
+                    address: s.address || '',
+                    name: nameInput ? nameInput.value.trim() : (s.name || ''),
+                    enabled: enabledCheckbox ? enabledCheckbox.checked : (s.enabled !== undefined ? s.enabled : true),
+                    correction: correctionInput ? (parseFloat(correctionInput.value) || 0.0) : (s.correction || 0.0),
+                    mode: modeSelect ? modeSelect.value : (s.mode || 'monitoring'),
+                    sendToNetworks: s.sendToNetworks !== undefined ? s.sendToNetworks : true,
+                    buzzerEnabled: s.buzzerEnabled || false,
+                    alertSettings: s.alertSettings || {
+                        minTemp: 10.0,
+                        maxTemp: 30.0,
+                        buzzerEnabled: true
+                    },
+                    stabilizationSettings: s.stabilizationSettings || {
+                        targetTemp: 25.0,
+                        tolerance: 0.1,
+                        alertThreshold: 0.2,
+                        duration: 10
+                    }
+                };
+            });
+            
+            // Отправляем через специальный API для датчиков
+            const sensorsResponse = await fetch('/api/sensors', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ sensors: sensorsToSave })
+            });
+            
+            if (!sensorsResponse.ok) {
+                throw new Error('Ошибка сохранения настроек термометров');
+            }
+            
+            // Перезагружаем список термометров после сохранения
+            await loadSensors();
+            renderSensors(); // Обновляем отображение в настройках
+            showMessage('Настройки термометров сохранены', 'success');
+        }
+        
+        // Сохраняем остальные настройки, если они есть
+        if (Object.keys(settings).length > 0) {
+            const response = await fetch('/api/settings', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(settings)
+            });
+            
+            if (!response.ok) {
+                throw new Error('Ошибка сохранения настроек');
+            }
+        }
+        
+        showMessage('Настройки успешно сохранены', 'success');
+        updateServiceStatus();
     } catch (error) {
         console.error('Error saving settings:', error);
-        showMessage('Ошибка сохранения настроек', 'error');
+        showMessage('Ошибка сохранения настроек: ' + error.message, 'error');
     }
 }
 
@@ -402,7 +489,21 @@ function loadSensors() {
                     id: 1,
                     name: 'Термометр 1',
                     enabled: true,
-                    correction: 0.0
+                    correction: 0.0,
+                    mode: 'monitoring',
+                    sendToNetworks: true,
+                    buzzerEnabled: false,
+                    alertSettings: {
+                        minTemp: 10.0,
+                        maxTemp: 30.0,
+                        buzzerEnabled: true
+                    },
+                    stabilizationSettings: {
+                        targetTemp: 25.0,
+                        tolerance: 0.1,
+                        alertThreshold: 0.2,
+                        duration: 10
+                    }
                 }];
             }
             renderSensors();
@@ -414,7 +515,21 @@ function loadSensors() {
                 id: 1,
                 name: 'Термометр 1',
                 enabled: true,
-                correction: 0.0
+                correction: 0.0,
+                mode: 'monitoring',
+                sendToNetworks: true,
+                buzzerEnabled: false,
+                alertSettings: {
+                    minTemp: 10.0,
+                    maxTemp: 30.0,
+                    buzzerEnabled: true
+                },
+                stabilizationSettings: {
+                    targetTemp: 25.0,
+                    tolerance: 0.1,
+                    alertThreshold: 0.2,
+                    duration: 10
+                }
             }];
             renderSensors();
         });
@@ -436,17 +551,16 @@ function renderSensors() {
         
         const number = document.createElement('span');
         number.style.cssText = 'font-weight: 600; color: var(--text-primary); font-size: 1.1rem;';
-        number.textContent = `Термометр ${sensor.id}`;
+        number.textContent = sensor.name || `Термометр ${sensor.index + 1}`;
         header.appendChild(number);
         
-        if (sensors.length > 1) {
-            const removeBtn = document.createElement('button');
-            removeBtn.className = 'sensor-remove';
-            removeBtn.style.cssText = 'background: var(--danger-color); color: white; border: none; border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 0.875rem;';
-            removeBtn.textContent = 'Удалить';
-            removeBtn.onclick = () => removeSensor(index);
-            header.appendChild(removeBtn);
-        }
+        // Показываем адрес термометра
+        const addressDiv = document.createElement('div');
+        addressDiv.style.cssText = 'font-size: 0.75rem; color: #757575; margin-top: 5px; font-family: monospace;';
+        addressDiv.textContent = 'Адрес: ' + (sensor.address || 'Неизвестно');
+        header.appendChild(addressDiv);
+        
+        // Убираем кнопку удаления, так как термометры определяются автоматически
         
         sensorDiv.appendChild(header);
         
@@ -471,12 +585,33 @@ function renderSensors() {
         const nameInput = document.createElement('input');
         nameInput.type = 'text';
         nameInput.id = `sensor-name-${index}`;
-        nameInput.value = sensor.name;
+        nameInput.value = sensor.name || `Термометр ${(sensor.index !== undefined ? sensor.index + 1 : index + 1)}`;
         nameInput.onchange = () => sensors[index].name = nameInput.value;
+        nameInput.oninput = () => sensors[index].name = nameInput.value;
         nameInput.placeholder = 'Имя термометра';
         nameDiv.appendChild(nameLabel);
         nameDiv.appendChild(nameInput);
         sensorDiv.appendChild(nameDiv);
+        
+        // Добавляем отображение текущей температуры
+        const tempDiv = document.createElement('div');
+        tempDiv.className = 'form-group';
+        tempDiv.style.cssText = 'background: #e3f2fd; padding: 10px; border-radius: 4px; margin-top: 10px;';
+        const tempLabel = document.createElement('label');
+        tempLabel.textContent = 'Текущая температура';
+        tempLabel.style.cssText = 'font-weight: 600; color: #1976d2;';
+        const tempValue = document.createElement('div');
+        tempValue.id = `sensor-temp-${index}`;
+        tempValue.style.cssText = 'font-size: 1.5rem; font-weight: 600; color: #1976d2; margin-top: 5px;';
+        tempValue.textContent = '--';
+        tempDiv.appendChild(tempLabel);
+        tempDiv.appendChild(tempValue);
+        sensorDiv.appendChild(tempDiv);
+        
+        // Обновляем температуру при загрузке
+        if (sensor.currentTemp !== undefined && sensor.currentTemp !== null) {
+            tempValue.textContent = (sensor.currentTemp + (sensor.correction || 0)).toFixed(1) + '°C';
+        }
         
         const correctionDiv = document.createElement('div');
         correctionDiv.className = 'form-group';
@@ -497,36 +632,52 @@ function renderSensors() {
         correctionDiv.appendChild(correctionSmall);
         sensorDiv.appendChild(correctionDiv);
         
+        // Добавляем выбор режима работы
+        const modeDiv = document.createElement('div');
+        modeDiv.className = 'form-group';
+        const modeLabel = document.createElement('label');
+        modeLabel.setAttribute('for', `sensor-mode-${index}`);
+        modeLabel.textContent = 'Режим работы';
+        const modeSelect = document.createElement('select');
+        modeSelect.id = `sensor-mode-${index}`;
+        modeSelect.style.cssText = 'width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 1rem;';
+        
+        const modeOptions = [
+            { value: 'monitoring', text: 'Мониторинг' },
+            { value: 'alert', text: 'Оповещение' },
+            { value: 'stabilization', text: 'Стабилизация' }
+        ];
+        
+        modeOptions.forEach(option => {
+            const optionEl = document.createElement('option');
+            optionEl.value = option.value;
+            optionEl.textContent = option.text;
+            if (sensor.mode === option.value) {
+                optionEl.selected = true;
+            }
+            modeSelect.appendChild(optionEl);
+        });
+        
+        modeSelect.onchange = () => {
+            sensors[index].mode = modeSelect.value;
+        };
+        
+        modeDiv.appendChild(modeLabel);
+        modeDiv.appendChild(modeSelect);
+        sensorDiv.appendChild(modeDiv);
+        
         container.appendChild(sensorDiv);
     });
 }
 
-function addSensor() {
-    if (sensors.length >= MAX_SENSORS) {
-        showMessage(`Максимум ${MAX_SENSORS} термометров`, 'error');
-        return;
-    }
-    
-    const newId = sensors.length > 0 ? Math.max(...sensors.map(s => s.id)) + 1 : 1;
-    sensors.push({
-        id: newId,
-        name: `Термометр ${newId}`,
-        enabled: true,
-        correction: 0.0
-    });
-    
-    renderSensors();
+// Функция обновления списка термометров (автоматическое обнаружение)
+async function refreshSensors() {
+    showMessage('Обновление списка термометров...', 'success');
+    await loadSensors();
+    showMessage('Список термометров обновлен', 'success');
 }
 
-function removeSensor(index) {
-    if (sensors.length <= 1) {
-        showMessage('Должен остаться хотя бы один термометр', 'error');
-        return;
-    }
-    
-    sensors.splice(index, 1);
-    renderSensors();
-}
+// Функция removeSensor удалена - термометры определяются автоматически
 
 // Функция отправки тестового сообщения в Telegram
 async function sendTelegramTest() {
@@ -548,6 +699,38 @@ async function sendTelegramTest() {
     } catch (error) {
         console.error('Error sending Telegram test:', error);
         showMessage('Ошибка отправки тестового сообщения в Telegram', 'error');
+    }
+}
+
+// Функция переключения MQTT
+async function toggleMqttEnabled() {
+    const mqttEnabled = document.getElementById('mqtt-enabled').checked;
+    
+    if (!mqttEnabled) {
+        // Отключаем MQTT принудительно
+        try {
+            const response = await fetch('/api/mqtt/disable', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
+            
+            if (response.ok) {
+                showMessage('MQTT отключен', 'success');
+                updateServiceStatus();
+            } else {
+                showMessage('Ошибка отключения MQTT', 'error');
+                document.getElementById('mqtt-enabled').checked = true; // Возвращаем чекбокс
+            }
+        } catch (error) {
+            console.error('Error disabling MQTT:', error);
+            showMessage('Ошибка отключения MQTT', 'error');
+            document.getElementById('mqtt-enabled').checked = true; // Возвращаем чекбокс
+        }
+    } else {
+        // Включаем MQTT - нужно сохранить настройки
+        showMessage('Сохраните настройки для включения MQTT', 'success');
     }
 }
 
@@ -574,10 +757,51 @@ async function sendMqttTest() {
     }
 }
 
+// Функция обновления температуры для всех термометров
+async function updateSensorsTemperature() {
+    try {
+        const response = await fetch('/api/sensors');
+        const data = await response.json();
+        
+        if (data.sensors && Array.isArray(data.sensors)) {
+            // Обновляем массив sensors, сохраняя порядок и настройки
+            data.sensors.forEach((sensor, dataIndex) => {
+                // Ищем по адресу (приоритет), затем по индексу
+                let index = -1;
+                if (sensor.address) {
+                    index = sensors.findIndex(s => s.address === sensor.address);
+                }
+                if (index < 0 && sensor.index !== undefined) {
+                    index = sensors.findIndex(s => s.index === sensor.index);
+                }
+                
+                if (index >= 0) {
+                    // Обновляем только температуру, сохраняя остальные настройки
+                    sensors[index].currentTemp = sensor.currentTemp;
+                    
+                    // Обновляем отображение температуры в настройках
+                    const tempElement = document.getElementById(`sensor-temp-${index}`);
+                    if (tempElement && sensor.currentTemp !== undefined && sensor.currentTemp !== null) {
+                        const correctedTemp = sensor.currentTemp + (sensors[index].correction || 0);
+                        tempElement.textContent = correctedTemp.toFixed(1) + '°C';
+                    }
+                }
+            });
+        }
+    } catch (error) {
+        console.error('Error updating sensors temperature:', error);
+    }
+}
+
 // Загрузить настройки при загрузке страницы
 document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
     // Загружаем термометры
     loadSensors();
     updateServiceStatus();
+    
+    // Обновляем температуру каждые 5 секунд
+    setInterval(updateSensorsTemperature, 5000);
+    // Первое обновление через 1 секунду
+    setTimeout(updateSensorsTemperature, 1000);
 });

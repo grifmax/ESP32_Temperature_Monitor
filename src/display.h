@@ -7,9 +7,12 @@
 #define DISPLAY_INFO       2
 
 void updateDisplay();
-void showTemperatureScreen();
+void showTemperatureScreen(int sensorIndex = -1);
 void showInfoScreen();
 void turnOffDisplay();
 void setDisplayScreen(int screen);
+int getCurrentSensorIndex();
+void setCurrentSensorIndex(int index);
+void nextSensor();
 
 #endif

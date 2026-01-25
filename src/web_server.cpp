@@ -3,6 +3,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <SPIFFS.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
 // #include <WiFiManager.h>  // Временно отключено
@@ -12,19 +13,38 @@
 #include "buzzer.h"
 #include "tg_bot.h"
 #include "mqtt_client.h"
+#include "sensors.h"
+#include <DallasTemperature.h>
 
 extern float currentTemp;
+extern DallasTemperature sensors;
 extern unsigned long deviceUptime;
 extern String deviceIP;
 extern int wifiRSSI;
 extern int displayScreen;
 extern unsigned long wifiConnectedSeconds;
+extern DallasTemperature sensors;
 // extern WiFiManager wm;  // Временно отключено
 
 AsyncWebServer server(80);
 
 // Файл для хранения настроек
 #define SETTINGS_FILE "/settings.json"
+
+// Preferences для надежного хранения критичных настроек
+Preferences preferences;
+#define PREF_NAMESPACE "esp32_thermo"
+#define PREF_WIFI_SSID "wifi_ssid"
+#define PREF_WIFI_PASS "wifi_pass"
+#define PREF_TG_TOKEN "tg_token"
+#define PREF_TG_CHATID "tg_chatid"
+#define PREF_MQTT_SERVER "mqtt_srv"
+#define PREF_MQTT_PORT "mqtt_port"
+#define PREF_MQTT_USER "mqtt_user"
+#define PREF_MQTT_PASS "mqtt_pass"
+#define PREF_MQTT_TOPIC_ST "mqtt_topic_st"
+#define PREF_MQTT_TOPIC_CT "mqtt_topic_ct"
+#define PREF_MQTT_SEC "mqtt_sec"
 
 void startWebServer() {
   // Главная страница
@@ -51,8 +71,8 @@ void startWebServer() {
   
   // JSON API endpoint для получения данных
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
-    // Оптимизировано с 512 до 384 для экономии памяти
-    StaticJsonDocument<640> doc;
+    // Увеличено для поддержки данных о термометрах
+    StaticJsonDocument<2048> doc;
     
     // Получаем актуальный IP адрес
     String currentIP = deviceIP;
@@ -146,6 +166,100 @@ void startWebServer() {
       doc["stabilization"]["tolerance"] = stab.tolerance;
     }
     
+    // Добавляем информацию о термометрах (автоматическое обнаружение)
+    scanSensors();
+    int foundCount = getSensorCount();
+    JsonArray sensorsArray = doc.createNestedArray("sensors");
+    
+    // Загружаем настройки из файла
+    String settingsJson = getSettings();
+    StaticJsonDocument<2048> settingsDoc;
+    DeserializationError settingsError = deserializeJson(settingsDoc, settingsJson);
+    
+    // Создаем карту сохраненных настроек по адресу
+    JsonObject savedSensorsMap;
+    if (!settingsError && settingsDoc.containsKey("sensors") && settingsDoc["sensors"].is<JsonArray>()) {
+      JsonArray savedSensors = settingsDoc["sensors"].as<JsonArray>();
+      for (JsonObject savedSensor : savedSensors) {
+        String savedAddress = savedSensor["address"] | "";
+        if (savedAddress.length() > 0) {
+          if (!savedSensorsMap.containsKey(savedAddress)) {
+            savedSensorsMap = savedSensorsMap.createNestedObject(savedAddress);
+            savedSensorsMap["name"] = savedSensor["name"] | "";
+            savedSensorsMap["enabled"] = savedSensor["enabled"] | true;
+            savedSensorsMap["correction"] = savedSensor["correction"] | 0.0;
+            savedSensorsMap["mode"] = savedSensor["mode"] | "monitoring";
+            savedSensorsMap["sendToNetworks"] = savedSensor["sendToNetworks"] | true;
+            savedSensorsMap["buzzerEnabled"] = savedSensor["buzzerEnabled"] | false;
+            if (savedSensor.containsKey("alertSettings")) {
+              savedSensorsMap["alertSettings"] = savedSensor["alertSettings"];
+            }
+            if (savedSensor.containsKey("stabilizationSettings")) {
+              savedSensorsMap["stabilizationSettings"] = savedSensor["stabilizationSettings"];
+            }
+          }
+        }
+      }
+    }
+    
+    // Запрашиваем температуру для всех датчиков
+    sensors.requestTemperatures();
+    
+    // Добавляем все найденные датчики
+    for (int i = 0; i < foundCount; i++) {
+      uint8_t address[8];
+      if (getSensorAddress(i, address)) {
+        String addressStr = getSensorAddressString(i);
+        float temp = getSensorTemperature(i);
+        
+        JsonObject sensor = sensorsArray.createNestedObject();
+        sensor["index"] = i;
+        sensor["address"] = addressStr;
+        
+        // Используем сохраненные настройки, если есть
+        if (savedSensorsMap.containsKey(addressStr)) {
+          JsonObject saved = savedSensorsMap[addressStr];
+          String defaultName = "Термометр " + String(i + 1);
+          String savedName = saved["name"].as<String>();
+          sensor["name"] = (savedName.length() > 0) ? savedName : defaultName;
+          sensor["enabled"] = saved["enabled"] | true;
+          sensor["correction"] = saved["correction"] | 0.0;
+          sensor["mode"] = saved["mode"] | "monitoring";
+          sensor["monitoringInterval"] = saved["monitoringInterval"] | 5;
+          sensor["sendToNetworks"] = saved["sendToNetworks"] | true;
+          sensor["buzzerEnabled"] = saved["buzzerEnabled"] | false;
+          
+          if (saved.containsKey("alertSettings")) {
+            sensor["alertSettings"] = saved["alertSettings"];
+          }
+          if (saved.containsKey("stabilizationSettings")) {
+            sensor["stabilizationSettings"] = saved["stabilizationSettings"];
+          }
+        } else {
+          // Настройки по умолчанию
+          sensor["name"] = "Термометр " + String(i + 1);
+          sensor["enabled"] = true;
+          sensor["correction"] = 0.0;
+          sensor["mode"] = "monitoring";
+          sensor["monitoringInterval"] = 5;
+          sensor["sendToNetworks"] = true;
+          sensor["buzzerEnabled"] = false;
+          sensor["alertSettings"]["minTemp"] = 10.0;
+          sensor["alertSettings"]["maxTemp"] = 30.0;
+          sensor["alertSettings"]["buzzerEnabled"] = true;
+          sensor["stabilizationSettings"]["targetTemp"] = 25.0;
+          sensor["stabilizationSettings"]["tolerance"] = 0.1;
+          sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
+          sensor["stabilizationSettings"]["duration"] = 10;
+        }
+        
+        // Текущая температура с учетом коррекции
+        float correction = sensor["correction"] | 0.0;
+        sensor["currentTemp"] = (temp != -127.0) ? (temp + correction) : -127.0;
+        sensor["stabilizationState"] = "tracking";
+      }
+    }
+    
     String response;
     serializeJson(doc, response);
     
@@ -160,7 +274,15 @@ void startWebServer() {
     unsigned long startTime = endTime;
     
     // Определение периода
-    if (period == "1h") {
+    if (period == "1m") {
+      startTime = endTime - 60; // 1 минута
+    } else if (period == "5m") {
+      startTime = endTime - 300; // 5 минут
+    } else if (period == "15m") {
+      startTime = endTime - 900; // 15 минут
+    } else if (period == "30m") {
+      startTime = endTime - 1800; // 30 минут
+    } else if (period == "1h") {
       startTime = endTime - 3600;
     } else if (period == "6h") {
       startTime = endTime - 21600;
@@ -182,9 +304,19 @@ void startWebServer() {
     JsonArray data = doc.createNestedArray("data");
     
     for (int i = 0; i < maxRecords; i++) {
+      // Пропускаем записи с нулевыми или невалидными значениями
+      if (records[i].temperature == 0.0 || records[i].temperature == -127.0 || records[i].timestamp == 0) {
+        continue;
+      }
+      
       JsonObject record = data.createNestedObject();
       record["timestamp"] = records[i].timestamp;
       record["temperature"] = records[i].temperature;
+      // Добавляем адрес термометра для идентификации
+      if (records[i].sensorAddress.length() > 0) {
+        record["sensor_address"] = records[i].sensorAddress;
+        record["sensor_id"] = records[i].sensorAddress; // Для совместимости
+      }
       yield(); // Предотвращаем watchdog reset
     }
     
@@ -291,29 +423,112 @@ void startWebServer() {
   
   // API для получения списка термометров
   server.on("/api/sensors", HTTP_GET, [](AsyncWebServerRequest *request){
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<4096> doc;
     JsonArray sensorsArray = doc.createNestedArray("sensors");
     
-    // Один термометр по умолчанию
-    JsonObject sensor1 = sensorsArray.createNestedObject();
-    sensor1["id"] = 1;
-    sensor1["name"] = "Термометр 1";
-    sensor1["enabled"] = true;
-    sensor1["correction"] = 0.0;
-    sensor1["mode"] = "monitoring";
-    sensor1["sendToNetworks"] = true;
-    sensor1["buzzerEnabled"] = false;
-    sensor1["currentTemp"] = currentTemp;
-    sensor1["stabilizationState"] = "tracking";
+    // Сканируем все датчики на шине OneWire
+    scanSensors();
+    int foundCount = getSensorCount();
     
-    // Настройки оповещения и стабилизации (минимальный набор)
-    sensor1["alertSettings"]["minTemp"] = 10.0;
-    sensor1["alertSettings"]["maxTemp"] = 30.0;
-    sensor1["alertSettings"]["buzzerEnabled"] = true;
-    sensor1["stabilizationSettings"]["targetTemp"] = 25.0;
-    sensor1["stabilizationSettings"]["tolerance"] = 0.1;
-    sensor1["stabilizationSettings"]["alertThreshold"] = 0.2;
-    sensor1["stabilizationSettings"]["duration"] = 10;
+    // Загружаем настройки из файла
+    String settingsJson = getSettings();
+    StaticJsonDocument<2048> settingsDoc;
+    DeserializationError error = deserializeJson(settingsDoc, settingsJson);
+    
+    // Создаем карту сохраненных настроек по адресу
+    StaticJsonDocument<1024> sensorsMapDoc;
+    JsonObject savedSensorsMap = sensorsMapDoc.to<JsonObject>();
+    if (!error && settingsDoc.containsKey("sensors") && settingsDoc["sensors"].is<JsonArray>()) {
+      JsonArray savedSensors = settingsDoc["sensors"].as<JsonArray>();
+      for (JsonObject savedSensor : savedSensors) {
+        String savedAddress = savedSensor["address"] | "";
+        if (savedAddress.length() > 0) {
+          // Создаем объект для этого адреса
+          JsonObject sensorMap = savedSensorsMap.createNestedObject(savedAddress);
+          sensorMap["name"] = savedSensor["name"] | "";
+          sensorMap["enabled"] = savedSensor["enabled"] | true;
+          sensorMap["correction"] = savedSensor["correction"] | 0.0;
+          String modeStr = savedSensor["mode"] | "monitoring";
+          sensorMap["mode"] = modeStr;
+          sensorMap["monitoringInterval"] = savedSensor["monitoringInterval"] | 5;
+          sensorMap["sendToNetworks"] = savedSensor["sendToNetworks"] | true;
+          sensorMap["buzzerEnabled"] = savedSensor["buzzerEnabled"] | false;
+          if (savedSensor.containsKey("alertSettings")) {
+            sensorMap["alertSettings"] = savedSensor["alertSettings"];
+          }
+          if (savedSensor.containsKey("stabilizationSettings")) {
+            sensorMap["stabilizationSettings"] = savedSensor["stabilizationSettings"];
+          }
+        }
+      }
+    }
+    
+    // Добавляем все найденные датчики
+    sensors.requestTemperatures(); // Запрашиваем температуру для всех датчиков
+    
+    for (int i = 0; i < foundCount; i++) {
+      uint8_t address[8];
+      if (getSensorAddress(i, address)) {
+        String addressStr = getSensorAddressString(i);
+        float temp = getSensorTemperature(i);
+        
+        JsonObject sensor = sensorsArray.createNestedObject();
+        sensor["index"] = i;
+        sensor["address"] = addressStr;
+        
+        // Используем сохраненные настройки, если есть
+        if (savedSensorsMap.containsKey(addressStr)) {
+          JsonObject saved = savedSensorsMap[addressStr];
+          String defaultName = "Термометр " + String(i + 1);
+          String savedName = saved["name"].as<String>();
+          sensor["name"] = (savedName.length() > 0) ? savedName : defaultName;
+          sensor["enabled"] = saved["enabled"] | true;
+          sensor["correction"] = saved["correction"] | 0.0;
+          sensor["mode"] = saved["mode"] | "monitoring";
+          sensor["monitoringInterval"] = saved["monitoringInterval"] | 5;
+          sensor["sendToNetworks"] = saved["sendToNetworks"] | true;
+          sensor["buzzerEnabled"] = saved["buzzerEnabled"] | false;
+          
+          if (saved.containsKey("alertSettings")) {
+            sensor["alertSettings"] = saved["alertSettings"];
+          } else {
+            sensor["alertSettings"]["minTemp"] = 10.0;
+            sensor["alertSettings"]["maxTemp"] = 30.0;
+            sensor["alertSettings"]["buzzerEnabled"] = true;
+          }
+          
+          if (saved.containsKey("stabilizationSettings")) {
+            sensor["stabilizationSettings"] = saved["stabilizationSettings"];
+          } else {
+            sensor["stabilizationSettings"]["targetTemp"] = 25.0;
+            sensor["stabilizationSettings"]["tolerance"] = 0.1;
+            sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
+            sensor["stabilizationSettings"]["duration"] = 10;
+          }
+        } else {
+          // Настройки по умолчанию для нового датчика
+          sensor["name"] = "Термометр " + String(i + 1);
+          sensor["enabled"] = true;
+          sensor["correction"] = 0.0;
+          sensor["mode"] = "monitoring";
+          sensor["monitoringInterval"] = 5;
+          sensor["sendToNetworks"] = true;
+          sensor["buzzerEnabled"] = false;
+          sensor["alertSettings"]["minTemp"] = 10.0;
+          sensor["alertSettings"]["maxTemp"] = 30.0;
+          sensor["alertSettings"]["buzzerEnabled"] = true;
+          sensor["stabilizationSettings"]["targetTemp"] = 25.0;
+          sensor["stabilizationSettings"]["tolerance"] = 0.1;
+          sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
+          sensor["stabilizationSettings"]["duration"] = 10;
+        }
+        
+        // Текущая температура с учетом коррекции
+        float correction = sensor["correction"] | 0.0;
+        sensor["currentTemp"] = (temp != -127.0) ? (temp + correction) : -127.0;
+        sensor["stabilizationState"] = "tracking";
+      }
+    }
     
     String response;
     serializeJson(doc, response);
@@ -331,14 +546,61 @@ void startWebServer() {
       sensorsRequestBody += String((char*)data).substring(0, len);
       
       if (index + len >= total) {
-        StaticJsonDocument<768> doc;
+        yield(); // Даем время другим задачам
+        
+        StaticJsonDocument<8192> doc; // Увеличиваем размер для всех настроек термометров
         DeserializationError error = deserializeJson(doc, sensorsRequestBody);
         
-        if (!error && doc.containsKey("sensors")) {
-          // TODO: Сохранять в файл настроек
+        if (error) {
+          Serial.print(F("ERROR: Failed to parse sensors JSON: "));
+          Serial.println(error.c_str());
+          Serial.print(F("JSON length: "));
+          Serial.println(sensorsRequestBody.length());
+          request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+          sensorsRequestBody = "";
+          return;
+        }
+        
+        if (!doc.containsKey("sensors")) {
+          Serial.println(F("ERROR: Missing 'sensors' key in JSON"));
+          request->send(400, "application/json", "{\"error\":\"Missing 'sensors' key\"}");
+          sensorsRequestBody = "";
+          return;
+        }
+        
+        // Загружаем существующие настройки
+        String settingsJson = getSettings();
+        StaticJsonDocument<8192> settingsDoc; // Увеличиваем размер
+        DeserializationError settingsError = deserializeJson(settingsDoc, settingsJson);
+        
+        if (settingsError) {
+          Serial.print(F("ERROR: Failed to parse existing settings: "));
+          Serial.println(settingsError.c_str());
+          request->send(500, "application/json", "{\"error\":\"Failed to load existing settings\"}");
+          sensorsRequestBody = "";
+          return;
+        }
+        
+        // Сохраняем датчики в настройки
+        settingsDoc["sensors"] = doc["sensors"];
+        
+        yield(); // Даем время перед сериализацией
+        
+        // Сохраняем в файл
+        String mergedJson;
+        serializeJson(settingsDoc, mergedJson);
+        
+        Serial.print(F("Saving sensors, JSON size: "));
+        Serial.println(mergedJson.length());
+        
+        if (saveSettings(mergedJson)) {
+          // Устанавливаем флаг для принудительной перезагрузки настроек в main.cpp
+          extern bool forceReloadSettings;
+          forceReloadSettings = true;
           request->send(200, "application/json", "{\"status\":\"ok\"}");
         } else {
-          request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+          Serial.println(F("ERROR: saveSettings returned false"));
+          request->send(500, "application/json", "{\"error\":\"Failed to save settings\"}");
         }
         
         sensorsRequestBody = "";
@@ -534,6 +796,13 @@ void startWebServer() {
     }
   });
   
+  // API для принудительного отключения MQTT
+  server.on("/api/mqtt/disable", HTTP_POST, [](AsyncWebServerRequest *request){
+    yield();
+    disableMqtt();
+    request->send(200, "application/json", "{\"status\":\"ok\",\"message\":\"MQTT disabled\"}");
+  });
+  
   // Обработчик для OPTIONS запросов (CORS preflight)
   server.onNotFound([](AsyncWebServerRequest *request){
     if (request->method() == HTTP_OPTIONS) {
@@ -555,14 +824,105 @@ void startWebServer() {
   Serial.println(F("Web server started"));
 }
 
-// Функция получения настроек из файла
+// Функция получения настроек из файла с резервным чтением из Preferences
 String getSettings() {
+  StaticJsonDocument<768> doc;
+  
+  // Сначала пытаемся загрузить из SPIFFS
   File file = SPIFFS.open(SETTINGS_FILE, "r");
-  if (!file) {
-    // Возвращаем настройки по умолчанию
-    StaticJsonDocument<768> doc;
+  if (file) {
+    String content = file.readString();
+    file.close();
+    
+    DeserializationError error = deserializeJson(doc, content);
+    if (!error) {
+      Serial.println(F("Settings loaded from SPIFFS"));
+    } else {
+      Serial.println(F("Failed to parse SPIFFS settings, trying Preferences"));
+    }
+  } else {
+    Serial.println(F("SPIFFS settings file not found, trying Preferences"));
+  }
+  
+  // Проверяем Preferences для критичных настроек (WiFi, Telegram, MQTT)
+  // Используем их если в SPIFFS нет данных или они пустые
+  // Используем прямое чтение с значениями по умолчанию - это не вызовет ошибок,
+  // если ключи не существуют (просто вернутся пустые строки/нули)
+  preferences.begin(PREF_NAMESPACE, true); // read-only mode
+  
+  String wifiSsid = preferences.getString(PREF_WIFI_SSID, "");
+  String wifiPass = preferences.getString(PREF_WIFI_PASS, "");
+  String tgToken = preferences.getString(PREF_TG_TOKEN, "");
+  String tgChatId = preferences.getString(PREF_TG_CHATID, "");
+  String mqttServer = preferences.getString(PREF_MQTT_SERVER, "");
+  int mqttPort = preferences.getInt(PREF_MQTT_PORT, 0);
+  String mqttUser = preferences.getString(PREF_MQTT_USER, "");
+  String mqttPass = preferences.getString(PREF_MQTT_PASS, "");
+  String mqttTopicSt = preferences.getString(PREF_MQTT_TOPIC_ST, "");
+  String mqttTopicCt = preferences.getString(PREF_MQTT_TOPIC_CT, "");
+  String mqttSec = preferences.getString(PREF_MQTT_SEC, "");
+  
+  preferences.end();
+  
+  // Если в Preferences есть данные, используем их (приоритет над SPIFFS для критичных настроек)
+  bool usePrefs = false;
+  if (wifiSsid.length() > 0) {
+    String spiffsSsid = doc.containsKey("wifi") ? doc["wifi"]["ssid"].as<String>() : "";
+    if (spiffsSsid.length() == 0) {
+      usePrefs = true;
+      Serial.println(F("WiFi SSID from Preferences (SPIFFS empty)"));
+    }
+  }
+  if (tgToken.length() > 0) {
+    String spiffsToken = doc.containsKey("telegram") ? doc["telegram"]["bot_token"].as<String>() : "";
+    if (spiffsToken.length() == 0) {
+      usePrefs = true;
+      Serial.println(F("Telegram token from Preferences (SPIFFS empty)"));
+    }
+  }
+  if (mqttServer.length() > 0) {
+    String spiffsMqtt = doc.containsKey("mqtt") ? doc["mqtt"]["server"].as<String>() : "";
+    if (spiffsMqtt.length() == 0) {
+      usePrefs = true;
+      Serial.println(F("MQTT server from Preferences (SPIFFS empty)"));
+    }
+  }
+  
+  if (usePrefs && (wifiSsid.length() > 0 || tgToken.length() > 0 || mqttServer.length() > 0)) {
+    Serial.println(F("Loading critical settings from Preferences (NVS)"));
+    if (wifiSsid.length() > 0) {
+      doc["wifi"]["ssid"] = wifiSsid;
+      doc["wifi"]["password"] = wifiPass;
+    }
+    if (tgToken.length() > 0) {
+      doc["telegram"]["bot_token"] = tgToken;
+      doc["telegram"]["chat_id"] = tgChatId;
+    }
+    if (mqttServer.length() > 0) {
+      doc["mqtt"]["server"] = mqttServer;
+      if (mqttPort > 0) {
+        doc["mqtt"]["port"] = mqttPort;
+      }
+      doc["mqtt"]["user"] = mqttUser;
+      doc["mqtt"]["password"] = mqttPass;
+      if (mqttTopicSt.length() > 0) {
+        doc["mqtt"]["topic_status"] = mqttTopicSt;
+      }
+      if (mqttTopicCt.length() > 0) {
+        doc["mqtt"]["topic_control"] = mqttTopicCt;
+      }
+      if (mqttSec.length() > 0) {
+        doc["mqtt"]["security"] = mqttSec;
+      }
+    }
+  }
+  
+  // Устанавливаем значения по умолчанию, если их нет
+  if (!doc.containsKey("wifi")) {
     doc["wifi"]["ssid"] = "";
     doc["wifi"]["password"] = "";
+  }
+  if (!doc.containsKey("mqtt")) {
     doc["mqtt"]["server"] = "";
     doc["mqtt"]["port"] = 1883;
     doc["mqtt"]["user"] = "";
@@ -570,38 +930,31 @@ String getSettings() {
     doc["mqtt"]["topic_status"] = "home/thermo/status";
     doc["mqtt"]["topic_control"] = "home/thermo/control";
     doc["mqtt"]["security"] = "none";
+  }
+  if (!doc.containsKey("telegram")) {
     doc["telegram"]["bot_token"] = "";
     doc["telegram"]["chat_id"] = "";
+  }
+  if (!doc.containsKey("temperature")) {
     doc["temperature"]["high_threshold"] = 30.0;
     doc["temperature"]["low_threshold"] = 10.0;
+  }
+  if (!doc.containsKey("timezone")) {
     doc["timezone"]["offset"] = 3; // UTC+3 по умолчанию
+  }
+  if (!doc.containsKey("operation_mode")) {
     doc["operation_mode"] = 0; // MODE_LOCAL по умолчанию
+  }
+  if (!doc.containsKey("alert")) {
     doc["alert"]["min_temp"] = 10.0;
     doc["alert"]["max_temp"] = 30.0;
     doc["alert"]["buzzer_enabled"] = true;
+  }
+  if (!doc.containsKey("stabilization")) {
     doc["stabilization"]["target_temp"] = 25.0;
     doc["stabilization"]["tolerance"] = 0.1;
     doc["stabilization"]["alert_threshold"] = 0.2;
     doc["stabilization"]["duration"] = 600;
-    
-    String result;
-    serializeJson(doc, result);
-    return result;
-  }
-  
-  String content = file.readString();
-  file.close();
-  
-  // Парсим и добавляем часовой пояс, если его нет
-  StaticJsonDocument<768> doc;
-  DeserializationError error = deserializeJson(doc, content);
-  if (error) {
-    Serial.println(F("Failed to parse settings file"));
-    return "{}";
-  }
-  
-  if (!doc["timezone"].containsKey("offset")) {
-    doc["timezone"]["offset"] = 3;
   }
   
   // Применяем часовой пояс при загрузке
@@ -620,31 +973,40 @@ bool saveSettings(String json) {
   yield(); // Даем время другим задачам перед началом обработки
   
   // Загружаем существующие настройки из файла
-  StaticJsonDocument<768> existingDoc;
+  // Увеличиваем размер документа для обработки всех настроек термометров
+  StaticJsonDocument<8192> existingDoc;
   String existingContent = "";
   File existingFile = SPIFFS.open(SETTINGS_FILE, "r");
   if (existingFile) {
     existingContent = existingFile.readString();
     existingFile.close();
     if (existingContent.length() > 0) {
-      deserializeJson(existingDoc, existingContent);
+      DeserializationError existingParseError = deserializeJson(existingDoc, existingContent);
+      if (existingParseError) {
+        Serial.print(F("Warning: Failed to parse existing settings: "));
+        Serial.println(existingParseError.c_str());
+      }
     }
   }
   
   yield(); // Даем время после чтения файла
   
   // Парсим новые настройки из запроса
-  StaticJsonDocument<768> newDoc;
+  // Увеличиваем размер для обработки всех настроек термометров
+  StaticJsonDocument<8192> newDoc;
   DeserializationError error = deserializeJson(newDoc, json);
   if (error) {
-    Serial.println(F("Failed to parse settings JSON"));
+    Serial.print(F("Failed to parse settings JSON: "));
+    Serial.println(error.c_str());
+    Serial.print(F("JSON length: "));
+    Serial.println(json.length());
     return false;
   }
   
   yield(); // Даем время после парсинга JSON
   
   // Объединяем настройки: сначала копируем существующие, затем перезаписываем новыми
-  StaticJsonDocument<768> mergedDoc;
+  StaticJsonDocument<8192> mergedDoc;
   
   // Копируем весь существующий документ через сериализацию/десериализацию для глубокого копирования
   if (existingContent.length() > 0 && existingContent != "null") {
@@ -793,6 +1155,11 @@ bool saveSettings(String json) {
     }
   }
   
+  // Сохраняем датчики, если они есть в новом запросе
+  if (newDoc.containsKey("sensors")) {
+    mergedDoc["sensors"] = newDoc["sensors"];
+  }
+  
   yield(); // Даем время после объединения
   
   // Применяем настройки
@@ -816,13 +1183,25 @@ bool saveSettings(String json) {
   }
   if (mergedDoc.containsKey("mqtt")) {
     String server = mergedDoc["mqtt"]["server"] | "";
+    server.trim();
     int port = mergedDoc["mqtt"]["port"] | 1883;
     String user = mergedDoc["mqtt"]["user"] | "";
     String password = mergedDoc["mqtt"]["password"] | "";
     String topicStatus = mergedDoc["mqtt"]["topic_status"] | "home/thermo/status";
     String topicControl = mergedDoc["mqtt"]["topic_control"] | "home/thermo/control";
     String security = mergedDoc["mqtt"]["security"] | "none";
-    setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
+    
+    // Проверяем, что сервер не является placeholder или пустым
+    // Если сервер пустой, "#", "null" или placeholder - отключаем MQTT
+    if (server.length() == 0 || 
+        server == "#" || 
+        server == "null" ||
+        server == "mqtt.server.com" ||
+        (server.startsWith("mqtt.") && server.endsWith(".com") && server.indexOf("server") != -1)) {
+      disableMqtt();
+    } else {
+      setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
+    }
     yield();
   }
   if (mergedDoc.containsKey("alert")) {
@@ -843,7 +1222,7 @@ bool saveSettings(String json) {
   
   yield(); // Даем время перед записью в файл
   
-  // Сохраняем объединенные настройки
+  // Сохраняем объединенные настройки в SPIFFS
   File file = SPIFFS.open(SETTINGS_FILE, "w");
   if (!file) {
     Serial.println(F("Failed to open settings file for writing"));
@@ -864,6 +1243,123 @@ bool saveSettings(String json) {
   Serial.print(output.length());
   Serial.print(F(" bytes, Written: "));
   Serial.println(bytesWritten);
+  
+  // Сохраняем критичные настройки (WiFi, Telegram, MQTT) в Preferences (NVS) как резерв
+  // Проверяем, что WiFi подключен перед сохранением (чтобы не блокировать работу)
+  bool wifiWasConnected = (WiFi.status() == WL_CONNECTED);
+  
+  // Даем больше времени WiFi перед началом записи в NVS
+  if (wifiWasConnected) {
+    delay(50); // Небольшая задержка для стабилизации WiFi
+    yield();
+  }
+  
+  preferences.begin(PREF_NAMESPACE, false); // read-write mode
+  
+  if (mergedDoc.containsKey("wifi")) {
+    String wifiSsid = mergedDoc["wifi"]["ssid"] | "";
+    String wifiPass = mergedDoc["wifi"]["password"] | "";
+    if (wifiSsid.length() > 0) {
+      bool success1 = preferences.putString(PREF_WIFI_SSID, wifiSsid);
+      delay(10); // Небольшая задержка между операциями NVS
+      yield();
+      bool success2 = preferences.putString(PREF_WIFI_PASS, wifiPass);
+      delay(10);
+      yield();
+      if (success1 && success2) {
+        Serial.println(F("WiFi settings saved to Preferences (NVS)"));
+      } else {
+        Serial.println(F("Failed to save WiFi settings to NVS"));
+      }
+    }
+  }
+  
+  delay(20); // Задержка между секциями
+  yield();
+  
+  if (mergedDoc.containsKey("telegram")) {
+    String tgToken = mergedDoc["telegram"]["bot_token"] | "";
+    String tgChatId = mergedDoc["telegram"]["chat_id"] | "";
+    if (tgToken.length() > 0 || tgChatId.length() > 0) {
+      bool success1 = preferences.putString(PREF_TG_TOKEN, tgToken);
+      delay(10);
+      yield();
+      bool success2 = preferences.putString(PREF_TG_CHATID, tgChatId);
+      delay(10);
+      yield();
+      if (success1 && success2) {
+        Serial.println(F("Telegram settings saved to Preferences (NVS)"));
+      } else {
+        Serial.println(F("Failed to save Telegram settings to NVS"));
+      }
+    }
+  }
+  
+  delay(20); // Задержка между секциями
+  yield();
+  
+  if (mergedDoc.containsKey("mqtt")) {
+    String mqttServer = mergedDoc["mqtt"]["server"] | "";
+    int mqttPort = mergedDoc["mqtt"]["port"] | 1883;
+    String mqttUser = mergedDoc["mqtt"]["user"] | "";
+    String mqttPass = mergedDoc["mqtt"]["password"] | "";
+    String mqttTopicSt = mergedDoc["mqtt"]["topic_status"] | "";
+    String mqttTopicCt = mergedDoc["mqtt"]["topic_control"] | "";
+    String mqttSec = mergedDoc["mqtt"]["security"] | "none";
+    
+    if (mqttServer.length() > 0 && mqttServer != "#" && mqttServer != "null") {
+      bool success1 = preferences.putString(PREF_MQTT_SERVER, mqttServer);
+      delay(10);
+      yield();
+      bool success2 = preferences.putInt(PREF_MQTT_PORT, mqttPort);
+      delay(10);
+      yield();
+      bool success3 = preferences.putString(PREF_MQTT_USER, mqttUser);
+      delay(10);
+      yield();
+      bool success4 = preferences.putString(PREF_MQTT_PASS, mqttPass);
+      delay(10);
+      yield();
+      if (mqttTopicSt.length() > 0) {
+        preferences.putString(PREF_MQTT_TOPIC_ST, mqttTopicSt);
+        yield();
+      }
+      if (mqttTopicCt.length() > 0) {
+        preferences.putString(PREF_MQTT_TOPIC_CT, mqttTopicCt);
+        yield();
+      }
+      bool success5 = preferences.putString(PREF_MQTT_SEC, mqttSec);
+      yield();
+      if (success1 && success2 && success3 && success4 && success5) {
+        Serial.println(F("MQTT settings saved to Preferences (NVS)"));
+      } else {
+        Serial.println(F("Failed to save MQTT settings to NVS"));
+      }
+    }
+  }
+  
+  preferences.end();
+  
+  // Даем время после завершения записи в NVS
+  delay(50);
+  yield();
+  
+  // Проверяем и восстанавливаем WiFi соединение, если оно было отключено
+  if (wifiWasConnected) {
+    delay(100); // Увеличиваем задержку для стабилизации WiFi
+    yield();
+    
+    // Проверяем, что WiFi все еще подключен
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("WiFi disconnected during settings save, attempting reconnect..."));
+      // Не пытаемся переподключиться здесь - это может вызвать зависание
+      // WiFi автоматически переподключится через встроенный механизм
+    } else {
+      // WiFi все еще подключен - даем дополнительное время для стабилизации
+      delay(50);
+      yield();
+    }
+  }
   
   // Проверяем, что файл действительно записался
   delay(100); // Небольшая задержка для завершения записи

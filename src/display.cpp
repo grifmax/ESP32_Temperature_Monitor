@@ -2,6 +2,7 @@
 #include "config.h"
 #include <WiFi.h>
 #include <U8g2lib.h>
+#include "sensors.h"
 
 // OLED 0.91" 128x32 SSD1306
 extern U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C display;
@@ -10,8 +11,31 @@ extern int displayScreen;
 extern String deviceIP;
 extern unsigned long deviceUptime;
 extern int wifiRSSI;
+// Forward declaration для SensorConfig
+struct SensorConfig {
+  String address;
+  String name;
+  bool enabled;
+  float correction;
+  String mode;
+  bool sendToNetworks;
+  bool buzzerEnabled;
+  float alertMinTemp;
+  float alertMaxTemp;
+  bool alertBuzzerEnabled;
+  float stabTargetTemp;
+  float stabTolerance;
+  float stabAlertThreshold;
+  unsigned long stabDuration;
+  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
+  bool valid;
+};
+
+extern SensorConfig sensorConfigs[];
+extern int sensorConfigCount;
 
 static int lastDisplayScreen = DISPLAY_OFF;
+static int currentSensorIndex = 0; // Индекс текущего отображаемого термометра
 
 void setDisplayScreen(int screen) {
   int previousScreen = displayScreen;
@@ -25,12 +49,80 @@ void turnOffDisplay() {
   display.sendBuffer();
 }
 
-void showTemperatureScreen() {
+void showTemperatureScreen(int sensorIndex) {
   display.clearBuffer();
+  
+  // Если индекс не указан, используем текущий
+  if (sensorIndex < 0) {
+    sensorIndex = currentSensorIndex;
+  }
+  
+  // Получаем количество доступных термометров
+  int sensorCount = getSensorCount();
+  if (sensorCount == 0) {
+    display.setFont(u8g2_font_6x10_tr);
+    display.setCursor(0, 16);
+    display.print("No sensors");
+    display.sendBuffer();
+    return;
+  }
+  
+  // Ограничиваем индекс
+  if (sensorIndex >= sensorCount) {
+    sensorIndex = 0;
+  }
+  if (sensorIndex < 0) {
+    sensorIndex = sensorCount - 1;
+  }
+  
+  // Получаем температуру для выбранного термометра
+  float temp = getSensorTemperature(sensorIndex);
+  if (temp == -127.0) {
+    temp = currentTemp; // Fallback на общую температуру
+  }
+  
+  // Применяем коррекцию, если есть настройки
+  float correctedTemp = temp;
+  String sensorName = "Sensor " + String(sensorIndex + 1);
+  for (int i = 0; i < sensorConfigCount; i++) {
+    String addressStr = getSensorAddressString(sensorIndex);
+    if (sensorConfigs[i].address == addressStr && sensorConfigs[i].enabled) {
+      correctedTemp = temp + sensorConfigs[i].correction;
+      if (sensorConfigs[i].name.length() > 0) {
+        sensorName = sensorConfigs[i].name;
+      }
+      break;
+    }
+  }
+  
+  // Отображаем имя термометра мелким шрифтом (верхняя строка)
+  display.setFont(u8g2_font_5x7_tr);
+  String nameDisplay = sensorName;
+  // Обрезаем имя, если оно слишком длинное
+  int maxNameWidth = 120;
+  int nameWidth = display.getUTF8Width(nameDisplay.c_str());
+  if (nameWidth > maxNameWidth) {
+    // Обрезаем имя
+    while (nameWidth > maxNameWidth && nameDisplay.length() > 0) {
+      nameDisplay = nameDisplay.substring(0, nameDisplay.length() - 1);
+      nameWidth = display.getUTF8Width(nameDisplay.c_str());
+    }
+    nameDisplay += "...";
+  }
+  display.setCursor(0, 7);
+  display.print(nameDisplay);
+  
+  // Отображаем номер термометра справа (если несколько)
+  if (sensorCount > 1) {
+    String counter = String(sensorIndex + 1) + "/" + String(sensorCount);
+    int counterWidth = display.getUTF8Width(counter.c_str());
+    display.setCursor(128 - counterWidth, 7);
+    display.print(counter);
+  }
   
   // Средний шрифт для температуры (дисплей 128x32)
   display.setFont(u8g2_font_logisoso22_tn);
-  String tempStr = String(currentTemp, 1);
+  String tempStr = String(correctedTemp, 1);
   int tempWidth = display.getUTF8Width(tempStr.c_str());
   int tempX = (128 - tempWidth - 15) / 2;
   display.setCursor(tempX, 26);
@@ -90,5 +182,34 @@ void updateDisplay() {
     showTemperatureScreen();
   } else if (displayScreen == DISPLAY_INFO) {
     showInfoScreen();
+  }
+}
+
+int getCurrentSensorIndex() {
+  return currentSensorIndex;
+}
+
+void setCurrentSensorIndex(int index) {
+  int sensorCount = getSensorCount();
+  if (sensorCount > 0) {
+    if (index < 0) {
+      currentSensorIndex = sensorCount - 1;
+    } else if (index >= sensorCount) {
+      currentSensorIndex = 0;
+    } else {
+      currentSensorIndex = index;
+    }
+  } else {
+    currentSensorIndex = 0;
+  }
+}
+
+void nextSensor() {
+  int sensorCount = getSensorCount();
+  if (sensorCount > 0) {
+    currentSensorIndex++;
+    if (currentSensorIndex >= sensorCount) {
+      currentSensorIndex = 0;
+    }
   }
 }

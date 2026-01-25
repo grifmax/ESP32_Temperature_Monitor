@@ -25,10 +25,13 @@ void setMqttConfig(const String& server, int port, const String& user, const Str
   trimmedServer.trim();
   
   // Проверяем, что сервер не пустой и не содержит некорректные символы
+  // Также проверяем, что это не placeholder из формы
   bool isValidServer = trimmedServer.length() > 0 && 
                        trimmedServer != "#" && 
                        trimmedServer != "null" &&
-                       trimmedServer.indexOf(' ') == -1; // Не содержит пробелов
+                       trimmedServer != "mqtt.server.com" &&  // Placeholder из формы
+                       trimmedServer.indexOf(' ') == -1 &&  // Не содержит пробелов
+                       !(trimmedServer.startsWith("mqtt.") && trimmedServer.endsWith(".com") && trimmedServer.indexOf("server") != -1);  // Общий паттерн placeholder
   
   if (isValidServer && port > 0 && port <= 65535) {
     mqttServer = trimmedServer;
@@ -62,32 +65,88 @@ void setMqttConfig(const String& server, int port, const String& user, const Str
   }
 }
 
+void disableMqtt() {
+  mqttClient.disconnect();
+  mqttServer = "";
+  mqttPort = 1883;
+  mqttUser = "";
+  mqttPassword = "";
+  mqttTopicStatus = "";
+  mqttTopicControl = "";
+  mqttSecurity = "none";
+  mqttClient.setServer("", 1883);
+  mqttConfigured = false;
+  Serial.println(F("MQTT disabled"));
+}
+
 void updateMqtt() {
+  // Проверяем, что MQTT настроен и сервер валидный
   if (!mqttConfigured || mqttServer.length() == 0) {
     return;
   }
   
   // Дополнительная проверка валидности сервера перед подключением
-  if (mqttServer == "#" || mqttServer == "null" || mqttServer.indexOf(' ') != -1) {
+  String trimmedServer = mqttServer;
+  trimmedServer.trim();
+  
+  // Если сервер невалидный (пустой, "#", "null", содержит пробелы, или это placeholder)
+  if (trimmedServer.length() == 0 || 
+      trimmedServer == "#" || 
+      trimmedServer == "null" || 
+      trimmedServer.indexOf(' ') != -1 ||
+      trimmedServer == "mqtt.server.com" ||  // Placeholder из формы
+      trimmedServer.startsWith("mqtt.") && trimmedServer.endsWith(".com") && trimmedServer.indexOf("server") != -1) {  // Общий паттерн placeholder
+    // Отключаем MQTT, если сервер невалидный
+    if (mqttClient.connected()) {
+      mqttClient.disconnect();
+    }
     mqttConfigured = false;
+    mqttServer = "";
     return;
   }
   
   if (!mqttClient.connected()) {
     if (WiFi.status() == WL_CONNECTED) {
+      // Дополнительная проверка стабильности WiFi перед подключением
+      if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+        // WiFi не имеет IP адреса, не пытаемся подключаться
+        return;
+      }
+      
+      // Устанавливаем таймаут для MQTT подключения
+      wifiClient.setTimeout(5); // 5 секунд таймаут
+      
       String clientId = "ESP32_Thermo_" + String(random(0xffff), HEX);
       bool connected = false;
+      
+      // Проверяем WiFi еще раз перед подключением
+      if (WiFi.status() != WL_CONNECTED) {
+        return; // WiFi отключился
+      }
+      
+      unsigned long connectStart = millis();
       if (mqttUser.length() > 0) {
         connected = mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPassword.c_str());
       } else {
         connected = mqttClient.connect(clientId.c_str());
+      }
+      unsigned long connectDuration = millis() - connectStart;
+      
+      // Проверяем, не отключился ли WiFi после попытки подключения
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println(F("MQTT: WiFi disconnected after connect attempt"));
+        mqttClient.disconnect();
+        return;
       }
       
       if (connected) {
         Serial.print(F("MQTT connected to "));
         Serial.print(mqttServer);
         Serial.print(F(":"));
-        Serial.println(mqttPort);
+        Serial.print(mqttPort);
+        Serial.print(F(" ("));
+        Serial.print(connectDuration);
+        Serial.println(F(" ms)"));
       } else {
         static unsigned long lastMqttError = 0;
         if (millis() - lastMqttError > 10000) { // Логируем ошибку не чаще раза в 10 секунд
@@ -96,12 +155,25 @@ void updateMqtt() {
           Serial.print(F(":"));
           Serial.print(mqttPort);
           Serial.print(F(" - state: "));
-          Serial.println(mqttClient.state());
+          Serial.print(mqttClient.state());
+          Serial.print(F(", duration: "));
+          Serial.print(connectDuration);
+          Serial.println(F(" ms"));
           lastMqttError = millis();
+        }
+        
+        // Если подключение заняло слишком много времени, это может быть DNS проблема
+        if (connectDuration > 8000) {
+          Serial.println(F("MQTT: Slow connection, possible DNS issue"));
         }
       }
     }
   } else {
+    // Проверяем, что WiFi все еще подключен перед loop()
+    if (WiFi.status() != WL_CONNECTED) {
+      mqttClient.disconnect();
+      return;
+    }
     mqttClient.loop();
   }
 }

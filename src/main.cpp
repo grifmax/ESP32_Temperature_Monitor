@@ -61,6 +61,44 @@ bool buttonPressed = false;
 int clickCount = 0;
 unsigned long lastClickTime = 0;
 
+// Кеш настроек термометров
+struct SensorConfig {
+  String address;
+  String name;
+  bool enabled;
+  float correction;
+  String mode;
+  bool sendToNetworks;
+  bool buzzerEnabled;
+  float alertMinTemp;
+  float alertMaxTemp;
+  bool alertBuzzerEnabled;
+  float stabTargetTemp;
+  float stabTolerance;
+  float stabAlertThreshold;
+  unsigned long stabDuration;
+  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
+  bool valid;
+};
+
+#define MAX_SENSORS 10
+SensorConfig sensorConfigs[MAX_SENSORS];
+int sensorConfigCount = 0;
+unsigned long lastSettingsReload = 0;
+const unsigned long SETTINGS_RELOAD_INTERVAL = 30000; // Перезагружаем настройки каждые 30 секунд
+
+// Состояния для отслеживания отправки
+struct SensorState {
+  float lastSentTemp;
+  unsigned long stabilizationStartTime;
+  bool isStabilized;
+};
+SensorState sensorStates[MAX_SENSORS];
+bool forceReloadSettings = false; // Флаг для принудительной перезагрузки настроек
+
+// Forward declaration
+void loadSensorConfigs();
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -74,6 +112,7 @@ void setup() {
     Serial.println(F("ERROR: Failed to mount SPIFFS, trying to format..."));
     if (!SPIFFS.format()) {
       Serial.println(F("ERROR: Failed to format SPIFFS!"));
+      Serial.println(F("Note: Critical settings (WiFi/Telegram) will be loaded from NVS if available"));
     } else {
       Serial.println(F("SPIFFS formatted, restarting..."));
       delay(2000);
@@ -82,6 +121,14 @@ void setup() {
   } else {
     Serial.println(F("SPIFFS mounted OK"));
   }
+  
+  // Preferences (NVS) инициализируется автоматически при первом использовании
+  Serial.println(F("Preferences (NVS) ready for critical settings backup"));
+  
+  // Инициализация истории температуры
+  initTemperatureHistory();
+  // Загружаем историю из SPIFFS, если она есть
+  loadHistoryFromSPIFFS();
   
   // Инициализация I2C
   Serial.println(F("Initializing I2C..."));
@@ -118,9 +165,7 @@ void setup() {
   // Инициализация датчиков температуры
   Serial.println(F("Initializing temperature sensors..."));
   sensors.begin();
-  
-  // Инициализация истории
-  initTemperatureHistory();
+  scanSensors(); // Сканируем все датчики при запуске
   
   // Загружаем сохраненные настройки WiFi, Telegram и MQTT (если есть)
   String savedSsid;
@@ -178,13 +223,25 @@ void setup() {
   }
   {
     String server = savedMqttServer.length() > 0 ? savedMqttServer : String(MQTT_SERVER);
+    server.trim();
     int port = savedMqttPort > 0 ? savedMqttPort : MQTT_PORT;
     String user = savedMqttUser.length() > 0 ? savedMqttUser : String(MQTT_USER);
     String password = savedMqttPassword.length() > 0 ? savedMqttPassword : String(MQTT_PASSWORD);
     String topicStatus = savedMqttTopicStatus.length() > 0 ? savedMqttTopicStatus : String(MQTT_TOPIC_STATUS);
     String topicControl = savedMqttTopicControl.length() > 0 ? savedMqttTopicControl : String(MQTT_TOPIC_CONTROL);
     String security = savedMqttSecurity.length() > 0 ? savedMqttSecurity : String("none");
-    setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
+    
+    // Проверяем, что сервер не является placeholder или пустым
+    // Если сервер пустой, "#", "null" или placeholder - отключаем MQTT
+    if (server.length() == 0 || 
+        server == "#" || 
+        server == "null" ||
+        server == "mqtt.server.com" ||
+        (server.startsWith("mqtt.") && server.endsWith(".com") && server.indexOf("server") != -1)) {
+      disableMqtt();
+    } else {
+      setMqttConfig(server, port, user, password, topicStatus, topicControl, security);
+    }
   }
 
   // Загружаем режим работы из настроек
@@ -259,6 +316,13 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
       deviceIP = WiFi.localIP().toString();
       wifiRSSI = WiFi.RSSI();
+      
+      // Настраиваем DNS серверы явно для предотвращения проблем с DNS lookup
+      // Используем публичные DNS серверы Google и Cloudflare
+      IPAddress dns1(8, 8, 8, 8);      // Google DNS
+      IPAddress dns2(1, 1, 1, 1);      // Cloudflare DNS
+      WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2);
+      Serial.println(F("DNS servers configured: 8.8.8.8, 1.1.1.1"));
       Serial.print(F("WiFi connected! IP: "));
       Serial.println(deviceIP);
     } else {
@@ -279,6 +343,17 @@ void setup() {
   
   Serial.println(F("Starting Telegram bot..."));
   startTelegramBot();
+  
+  // Инициализация состояний термометров
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    sensorStates[i].lastSentTemp = 0.0;
+    sensorStates[i].stabilizationStartTime = 0;
+    sensorStates[i].isStabilized = false;
+    sensorConfigs[i].valid = false;
+  }
+  
+  // Загружаем настройки термометров
+  loadSensorConfigs();
   
   Serial.println(F("========================================"));
   Serial.println(F("Setup complete!"));
@@ -346,10 +421,13 @@ void handleButton() {
         
         if (displayScreen == DISPLAY_OFF) {
           setDisplayScreen(DISPLAY_TEMP);
+          setCurrentSensorIndex(0); // Сбрасываем на первый термометр
         } else if (displayScreen == DISPLAY_TEMP) {
-          setDisplayScreen(DISPLAY_INFO);
+          // Переключаем термометр вместо переключения экрана
+          nextSensor();
         } else if (displayScreen == DISPLAY_INFO) {
           setDisplayScreen(DISPLAY_TEMP);
+          setCurrentSensorIndex(0); // Сбрасываем на первый термометр
         }
         
         displayTimeout = millis() + (DISPLAY_TIMEOUT * 1000);
@@ -362,6 +440,77 @@ void handleButton() {
   if (clickCount == 1 && (currentTime - lastClickTime) > BUTTON_DOUBLE_CLICK_TIME) {
     clickCount = 0;
   }
+}
+
+// Функция загрузки настроек термометров в кеш
+void loadSensorConfigs() {
+  sensorConfigCount = 0;
+  
+  String settingsJson = getSettings();
+  StaticJsonDocument<4096> doc;
+  DeserializationError error = deserializeJson(doc, settingsJson);
+  
+  if (error || !doc.containsKey("sensors")) {
+    Serial.println(F("No sensor settings found or parse error"));
+    return;
+  }
+  
+  JsonArray sensorsArray = doc["sensors"];
+  int count = sensorsArray.size();
+  if (count > MAX_SENSORS) count = MAX_SENSORS;
+  
+  for (int i = 0; i < count; i++) {
+    JsonObject sensor = sensorsArray[i];
+    SensorConfig& config = sensorConfigs[sensorConfigCount];
+    
+    config.address = sensor["address"] | "";
+    String nameStr = sensor["name"].as<String>();
+    if (nameStr.length() == 0) {
+      config.name = "Термометр " + String(sensorConfigCount + 1);
+    } else {
+      config.name = nameStr;
+    }
+    config.enabled = sensor["enabled"] | true;
+    config.correction = sensor["correction"] | 0.0;
+    String modeStr = sensor["mode"] | "monitoring";
+    config.mode = modeStr;
+    config.sendToNetworks = sensor["sendToNetworks"] | true;
+    config.buzzerEnabled = sensor["buzzerEnabled"] | false;
+    config.monitoringInterval = sensor["monitoringInterval"] | 5; // По умолчанию 5 секунд
+    
+    // Настройки оповещения
+    if (sensor.containsKey("alertSettings")) {
+      JsonObject alert = sensor["alertSettings"];
+      config.alertMinTemp = alert["minTemp"] | 10.0;
+      config.alertMaxTemp = alert["maxTemp"] | 30.0;
+      config.alertBuzzerEnabled = alert["buzzerEnabled"] | true;
+    } else {
+      config.alertMinTemp = 10.0;
+      config.alertMaxTemp = 30.0;
+      config.alertBuzzerEnabled = true;
+    }
+    
+    // Настройки стабилизации
+    if (sensor.containsKey("stabilizationSettings")) {
+      JsonObject stab = sensor["stabilizationSettings"];
+      config.stabTargetTemp = stab["targetTemp"] | 25.0;
+      config.stabTolerance = stab["tolerance"] | 0.1;
+      config.stabAlertThreshold = stab["alertThreshold"] | 0.2;
+      config.stabDuration = (stab["duration"] | 10) * 1000; // Конвертируем в миллисекунды
+    } else {
+      config.stabTargetTemp = 25.0;
+      config.stabTolerance = 0.1;
+      config.stabAlertThreshold = 0.2;
+      config.stabDuration = 10000; // 10 секунд по умолчанию
+    }
+    
+    config.valid = true;
+    sensorConfigCount++;
+  }
+  
+  Serial.print(F("Loaded "));
+  Serial.print(sensorConfigCount);
+  Serial.println(F(" sensor configurations"));
 }
 
 void loop() {
@@ -441,69 +590,239 @@ void loop() {
     lastMqttMetricsUpdate = millis();
   }
   
-  OperationMode mode = getOperationMode();
+  // Перезагружаем настройки термометров каждые 30 секунд или принудительно после сохранения
+  // Но не чаще, чем раз в 5 секунд, чтобы не перегружать систему
+  static unsigned long lastReloadCheck = 0;
+  if (millis() - lastReloadCheck > 5000) {
+    lastReloadCheck = millis();
+    if (forceReloadSettings || (millis() - lastSettingsReload > SETTINGS_RELOAD_INTERVAL)) {
+      loadSensorConfigs();
+      lastSettingsReload = millis();
+      forceReloadSettings = false;
+    }
+  }
   
   // Чтение температуры каждые 10 секунд
   if (millis() - lastSensorUpdate > 10000) {
     readTemperature();
     lastSensorUpdate = millis();
     
-    addTemperatureRecord(currentTemp);
+    int sensorCount = getSensorCount();
     
-    switch(mode) {
-      case MODE_LOCAL:
-        break;
-        
-      case MODE_MONITORING:
-        if (abs(currentTemp - lastSentTemp) > 0.1) {
-          sendMetricsToTelegram();
-          lastSentTemp = currentTemp;
+    // Обрабатываем каждый термометр
+    for (int i = 0; i < sensorCount && i < MAX_SENSORS; i++) {
+      uint8_t address[8];
+      if (!getSensorAddress(i, address)) {
+        continue;
+      }
+      String addressStr = getSensorAddressString(i);
+      
+      // Находим настройки по адресу в кеше
+      SensorConfig* config = nullptr;
+      for (int j = 0; j < sensorConfigCount; j++) {
+        if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
+          config = &sensorConfigs[j];
+          break;
         }
-        break;
-        
-      case MODE_ALERT:
-        {
-          AlertModeSettings alert = getAlertSettings();
-          if (currentTemp <= alert.minTemp || currentTemp >= alert.maxTemp) {
-            if (abs(currentTemp - lastSentTemp) > 0.1) {
-              sendTemperatureAlert(currentTemp);
-              if (alert.buzzerEnabled) {
-                buzzerBeep(BUZZER_ALERT);
+      }
+      
+      // Пропускаем термометры без настроек
+      if (!config || !config->valid) {
+        continue;
+      }
+      
+      // Проверяем, включен ли термометр и отправка в сети
+      if (!config->enabled || !config->sendToNetworks) {
+        continue;
+      }
+      
+      // Получаем температуру термометра
+      float temp = getSensorTemperature(i);
+      float correctedTemp = (temp != -127.0) ? (temp + config->correction) : -127.0;
+      
+      if (correctedTemp == -127.0) {
+        continue; // Пропускаем невалидные температуры
+      }
+      
+      // Сохраняем историю температуры для этого термометра
+      addTemperatureRecord(correctedTemp, addressStr);
+      
+      // Обрабатываем режим работы термометра
+      if (config->mode == "monitoring") {
+        if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
+          // Обновляем lastSentTemp для текущего термометра
+          sensorStates[i].lastSentTemp = correctedTemp;
+          
+          // Проверяем, нужно ли отправить метрики (только если WiFi подключен)
+          // Используем индивидуальный интервал для каждого термометра
+          static unsigned long lastMetricsSend[MAX_SENSORS] = {0};
+          unsigned long intervalMs = (config->monitoringInterval > 0) ? (config->monitoringInterval * 1000) : 5000;
+          if (WiFi.status() == WL_CONNECTED && (millis() - lastMetricsSend[i] > intervalMs)) {
+            // Отправляем метрики для всех термометров одним сообщением
+            sendMetricsToTelegram("", -127.0); // Пустое имя означает "отправить все"
+            lastMetricsSend[i] = millis();
+            
+            // Обновляем lastSentTemp для всех термометров, чтобы не отправлять повторно
+            // Упрощенная версия - обновляем только те, которые мы обрабатываем
+            for (int j = 0; j < sensorCount && j < MAX_SENSORS; j++) {
+              if (j == i) continue; // Уже обновили
+              uint8_t addr[8];
+              if (getSensorAddress(j, addr)) {
+                String addrStr = getSensorAddressString(j);
+                // Ищем настройки для этого термометра
+                for (int k = 0; k < sensorConfigCount; k++) {
+                  if (sensorConfigs[k].valid && sensorConfigs[k].address == addrStr) {
+                    float temp = getSensorTemperature(j);
+                    float corr = (temp != -127.0) ? (temp + sensorConfigs[k].correction) : -127.0;
+                    if (corr != -127.0) {
+                      sensorStates[j].lastSentTemp = corr;
+                    }
+                    break; // Нашли, выходим
+                  }
+                }
               }
-              lastSentTemp = currentTemp;
+              yield(); // Даем время другим задачам
             }
           }
+          break; // Обработали, выходим из цикла
         }
-        break;
+      } else if (config->mode == "alert") {
+        if (correctedTemp <= config->alertMinTemp || correctedTemp >= config->alertMaxTemp) {
+          if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
+            String alertType = (correctedTemp >= config->alertMaxTemp) ? "high" : "low";
+            sendTemperatureAlert(config->name, correctedTemp, alertType);
+            if (config->alertBuzzerEnabled) {
+              buzzerBeep(BUZZER_ALERT);
+            }
+            sensorStates[i].lastSentTemp = correctedTemp;
+          }
+        }
+      } else if (config->mode == "stabilization") {
+        float diff = abs(correctedTemp - config->stabTargetTemp);
         
-      case MODE_STABILIZATION:
-        {
-          StabilizationModeSettings stab = getStabilizationSettings();
-          
-          bool stabilized = checkStabilization(currentTemp);
-          if (stabilized) {
-            buzzerBeep(BUZZER_STABILIZATION);
-            sendMetricsToTelegram();
+        // Проверка стабилизации
+        if (diff <= config->stabTolerance) {
+          if (!sensorStates[i].isStabilized) {
+            sensorStates[i].isStabilized = true;
+            sensorStates[i].stabilizationStartTime = millis();
           }
           
-          if (checkStabilizationAlert(currentTemp)) {
+          if (millis() - sensorStates[i].stabilizationStartTime >= config->stabDuration) {
+            buzzerBeep(BUZZER_STABILIZATION);
+            sensorStates[i].stabilizationStartTime = millis() + 60000; // Не отправляем снова в течение минуты
+            
+            // Отправляем метрики только если WiFi подключен
+            if (WiFi.status() == WL_CONNECTED) {
+              sendMetricsToTelegram("", -127.0); // Пустое имя означает "отправить все"
+              
+              // Обновляем lastSentTemp для всех термометров (упрощенная версия)
+              for (int j = 0; j < sensorCount && j < MAX_SENSORS; j++) {
+                if (j == i) {
+                  sensorStates[j].lastSentTemp = correctedTemp;
+                  continue;
+                }
+                uint8_t addr[8];
+                if (getSensorAddress(j, addr)) {
+                  String addrStr = getSensorAddressString(j);
+                  for (int k = 0; k < sensorConfigCount; k++) {
+                    if (sensorConfigs[k].valid && sensorConfigs[k].address == addrStr) {
+                      float temp = getSensorTemperature(j);
+                      float corr = (temp != -127.0) ? (temp + sensorConfigs[k].correction) : -127.0;
+                      if (corr != -127.0) {
+                        sensorStates[j].lastSentTemp = corr;
+                      }
+                      break;
+                    }
+                  }
+                }
+                yield(); // Даем время другим задачам
+              }
+            }
+            break; // Обработали, выходим
+          }
+        } else {
+          sensorStates[i].isStabilized = false;
+        }
+        
+        // Проверка тревоги стабилизации
+        if (diff > config->stabAlertThreshold) {
+          if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
+            sendTemperatureAlert(config->name, correctedTemp, "⚠️ Отклонение от целевой температуры!");
             buzzerBeep(BUZZER_ALERT);
-            sendTemperatureAlert(currentTemp);
+            sensorStates[i].lastSentTemp = correctedTemp;
           }
         }
-        break;
+      }
+    }
+    
+    // Старая логика для обратной совместимости (если нет настроек термометров)
+    if (sensorConfigCount == 0) {
+      // Старая логика для обратной совместимости (один термометр)
+      OperationMode mode = getOperationMode();
+      String addressStr = (sensorCount > 0) ? getSensorAddressString(0) : "";
+      addTemperatureRecord(currentTemp, addressStr);
+      
+      switch(mode) {
+        case MODE_LOCAL:
+          break;
+          
+        case MODE_MONITORING:
+          if (abs(currentTemp - lastSentTemp) > 0.1) {
+            sendMetricsToTelegram();
+            lastSentTemp = currentTemp;
+          }
+          break;
+          
+        case MODE_ALERT:
+          {
+            AlertModeSettings alert = getAlertSettings();
+            if (currentTemp <= alert.minTemp || currentTemp >= alert.maxTemp) {
+              if (abs(currentTemp - lastSentTemp) > 0.1) {
+                sendTemperatureAlert(currentTemp);
+                if (alert.buzzerEnabled) {
+                  buzzerBeep(BUZZER_ALERT);
+                }
+                lastSentTemp = currentTemp;
+              }
+            }
+          }
+          break;
+          
+        case MODE_STABILIZATION:
+          {
+            StabilizationModeSettings stab = getStabilizationSettings();
+            
+            bool stabilized = checkStabilization(currentTemp);
+            if (stabilized) {
+              buzzerBeep(BUZZER_STABILIZATION);
+              sendMetricsToTelegram();
+            }
+            
+            if (checkStabilizationAlert(currentTemp)) {
+              buzzerBeep(BUZZER_ALERT);
+              sendTemperatureAlert(currentTemp);
+            }
+          }
+          break;
+      }
     }
   }
   
   // Обработка Telegram сообщений (каждые 5 секунд, чтобы не перегружать API)
   static unsigned long lastTelegramPoll = 0;
   if (WiFi.status() == WL_CONNECTED && millis() - lastTelegramPoll > 5000) {
+    yield(); // Даем время другим задачам перед обработкой Telegram
     handleTelegramMessages();
     lastTelegramPoll = millis();
+    yield(); // Даем время после обработки
   }
   
-  // Обработка очереди Telegram сообщений (каждые 100 мс, но только если есть сообщения)
+  // Обработка очереди Telegram сообщений (каждую итерацию, но только если есть сообщения)
+  // Это должно вызываться часто, чтобы сообщения отправлялись быстро
+  // Но не блокируем выполнение, если очередь пуста
   processTelegramQueue();
+  
+  yield(); // Даем время другим задачам в конце цикла
   
   updateDisplay();
 }

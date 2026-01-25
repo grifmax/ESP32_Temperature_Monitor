@@ -6,6 +6,21 @@
     <title>ESP32 Temperature Monitor</title>
     <link rel="stylesheet" href="style.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <script>
+        // Регистрируем плагин масштабирования глобально для Chart.js v4
+        if (typeof Chart !== 'undefined') {
+            // Плагин автоматически регистрируется при загрузке
+            // Но можно явно зарегистрировать, если нужно
+            try {
+                if (typeof zoomPlugin !== 'undefined') {
+                    Chart.register(zoomPlugin);
+                }
+            } catch(e) {
+                console.log('Zoom plugin will be registered automatically');
+            }
+        }
+    </script>
 </head>
 <body>
     <div class="container">
@@ -19,6 +34,16 @@
                     </div>
                     <div id="ip-address-header" style="font-size: 0.875rem; opacity: 0.9; font-family: 'Courier New', monospace;">--</div>
                     <div id="uptime-header" style="font-size: 0.875rem; opacity: 0.9;">⏱️ <span id="uptime-header-value">--</span></div>
+                    <!-- Статус MQTT -->
+                    <div id="mqtt-status-header" style="display: flex; align-items: center; gap: 5px; font-size: 0.875rem;">
+                        <span style="opacity: 0.9;">MQTT</span>
+                        <div id="mqtt-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: #f44336; display: inline-block;"></div>
+                    </div>
+                    <!-- Статус Telegram -->
+                    <div id="telegram-status-header" style="display: flex; align-items: center; gap: 5px; font-size: 0.875rem;">
+                        <span style="opacity: 0.9;">Telegram</span>
+                        <div id="telegram-status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: #f44336; display: inline-block;"></div>
+                    </div>
                     <a href="/settings.html" style="color: white; text-decoration: none; opacity: 0.9; font-size: 0.9rem; padding: 8px 16px; background: rgba(255, 255, 255, 0.2); border-radius: 8px; display: inline-block;">⚙️ Настройки</a>
                 </div>
             </div>
@@ -38,49 +63,20 @@
                 </div>
             </div>
             
-            <!-- Сеть и сервисы -->
-            <div class="tile">
-                <div class="tile-header">
-                    <span class="tile-icon">🌐</span>
-                    <span class="tile-title">Сеть и сервисы</span>
-                </div>
-                <div class="tile-content status-list">
-                    <div class="status-row">
-                        <span class="status-label">Wi-Fi</span>
-                        <span id="wifi-status-text" class="status-value">--</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">IP</span>
-                        <span id="ip-address-main" class="status-mono">--</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">В сети</span>
-                        <span id="wifi-connected-time" class="status-value">--</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">Время</span>
-                        <span id="current-time" class="status-mono">--</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">MQTT</span>
-                        <span id="mqtt-status" class="status-value">--</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">Telegram</span>
-                        <span id="telegram-status" class="status-value">--</span>
-                    </div>
-                </div>
-            </div>
-            
             <div class="tile tile-large chart-tile">
                 <div class="tile-header">
                     <span class="tile-icon">📊</span>
                     <span class="tile-title">График температуры</span>
-                    <div style="margin-left: auto; display: flex; gap: 5px;">
+                    <div style="margin-left: auto; display: flex; gap: 5px; flex-wrap: wrap;">
+                        <button onclick="loadChart('1m')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">1м</button>
+                        <button onclick="loadChart('5m')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">5м</button>
+                        <button onclick="loadChart('15m')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">15м</button>
+                        <button onclick="loadChart('30m')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">30м</button>
                         <button onclick="loadChart('1h')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">1ч</button>
                         <button onclick="loadChart('6h')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">6ч</button>
                         <button onclick="loadChart('24h')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">24ч</button>
                         <button onclick="loadChart('7d')" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: white; cursor: pointer;">7д</button>
+                        <button onclick="resetChartZoom()" style="padding: 4px 8px; font-size: 0.75rem; border: 1px solid #e0e0e0; border-radius: 4px; background: #f5f5f5; cursor: pointer;" title="Сбросить масштаб">↺</button>
                     </div>
                 </div>
                 <div class="tile-content">
@@ -101,12 +97,27 @@
                     <input type="hidden" id="modal-sensor-id" value="">
                     
                     <div class="form-group">
+                        <label for="modal-sensor-name-input">Название термометра</label>
+                        <input type="text" id="modal-sensor-name-input" placeholder="Введите название">
+                    </div>
+                    
+                    <div class="form-group">
                         <label for="modal-sensor-mode">Режим работы</label>
                         <select id="modal-sensor-mode" onchange="updateSensorModeSettings(this.value)">
                             <option value="monitoring">Мониторинг</option>
                             <option value="alert">Оповещение</option>
                             <option value="stabilization">Стабилизация</option>
                         </select>
+                    </div>
+                    
+                    <!-- Настройки режима мониторинга -->
+                    <div id="modal-monitoring-settings" class="mode-settings-group" style="display: none;">
+                        <h3>Настройки мониторинга</h3>
+                        <div class="form-group">
+                            <label for="modal-monitoring-interval">Интервал отправки (секунды)</label>
+                            <input type="number" id="modal-monitoring-interval" min="1" max="3600" value="5">
+                            <small>Минимальный интервал между отправками показаний в Telegram/MQTT</small>
+                        </div>
                     </div>
                     
                     <!-- Настройки режима оповещения -->

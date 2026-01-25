@@ -50,8 +50,8 @@
 ### Шаги установки
 
 1. **Клонирование репозитория**:
-   ```bash
-   git clone https://github.com/yourusername/esp32-temperature-monitor.git
+    ```bash
+    git clone https://github.com/yourusername/esp32-temperature-monitor.git
    cd esp32-temperature-monitor
    ```
 

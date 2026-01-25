@@ -10,13 +10,7 @@ const elements = {
     ipAddressHeader: document.getElementById('ip-address-header'),
     uptimeHeaderValue: document.getElementById('uptime-header-value'),
     lastUpdate: document.getElementById('last-update'),
-    sensorsGrid: document.getElementById('sensors-grid'),
-    wifiStatusText: document.getElementById('wifi-status-text'),
-    ipAddressMain: document.getElementById('ip-address-main'),
-    wifiConnectedTime: document.getElementById('wifi-connected-time'),
-    currentTime: document.getElementById('current-time'),
-    mqttStatus: document.getElementById('mqtt-status'),
-    telegramStatus: document.getElementById('telegram-status')
+    sensorsGrid: document.getElementById('sensors-grid')
 };
 
 // Состояние
@@ -25,6 +19,8 @@ let temperatureChart = null;
 let currentChartPeriod = '24h';
 let sensors = [];
 let sensorsData = {}; // Данные по каждому термометру {id: {currentTemp, stabilizationState}}
+let chartZoom = { min: null, max: null }; // Масштаб графика
+let chartPan = { offset: 0 }; // Смещение графика
 
 // Функция форматирования времени
 function formatTime(date) {
@@ -61,25 +57,9 @@ function updateUI(data) {
         elements.ipAddressHeader.textContent = data.ip || '--';
     }
 
-    if (elements.ipAddressMain) {
-        elements.ipAddressMain.textContent = data.ip || '--';
-    }
-    
     // Uptime
     if (elements.uptimeHeaderValue) {
         elements.uptimeHeaderValue.textContent = data.uptime_formatted || '--';
-    }
-
-    if (elements.wifiConnectedTime) {
-        elements.wifiConnectedTime.textContent = data.wifi_connected_formatted || '--';
-    }
-
-    if (elements.currentTime) {
-        if (data.time_synced) {
-            elements.currentTime.textContent = data.current_time || '--:--:--';
-        } else {
-            elements.currentTime.textContent = 'Не синхр.';
-        }
     }
 
     if (elements.wifiStatusText) {
@@ -90,14 +70,14 @@ function updateUI(data) {
         elements.mqttStatus.textContent = formatMqttStatus(data.mqtt);
     }
 
-    if (elements.telegramStatus) {
-        elements.telegramStatus.textContent = formatTelegramStatus(data.telegram);
-    }
+    // Обновляем статусы MQTT и Telegram в тулбаре
+    updateServiceStatusDots(data.mqtt, data.telegram);
     
-    // Обновляем данные термометров
+    // Обновляем данные термометров (используем адрес как ключ)
     if (data.sensors && Array.isArray(data.sensors)) {
         data.sensors.forEach(sensor => {
-            sensorsData[sensor.id] = {
+            const key = sensor.address || sensor.index || sensor.id;
+            sensorsData[key] = {
                 currentTemp: sensor.currentTemp,
                 stabilizationState: sensor.stabilizationState || 'tracking'
             };
@@ -121,6 +101,33 @@ function formatTelegramStatus(telegram) {
     if (telegram.status === 'connected') return 'Подключен';
     if (telegram.status === 'not_initialized') return 'Не инициализ.';
     return 'Подключение...';
+}
+
+// Обновление статусов в виде цветных точек в тулбаре
+function updateServiceStatusDots(mqtt, telegram) {
+    // MQTT статус
+    const mqttDot = document.getElementById('mqtt-status-dot');
+    if (mqttDot) {
+        if (mqtt && mqtt.status === 'connected') {
+            mqttDot.style.background = '#4CAF50'; // Зеленая
+        } else if (mqtt && mqtt.status === 'not_configured') {
+            mqttDot.style.background = '#9E9E9E'; // Серая (не настроен)
+        } else {
+            mqttDot.style.background = '#f44336'; // Красная
+        }
+    }
+    
+    // Telegram статус
+    const telegramDot = document.getElementById('telegram-status-dot');
+    if (telegramDot) {
+        if (telegram && telegram.status === 'connected') {
+            telegramDot.style.background = '#4CAF50'; // Зеленая
+        } else if (telegram && telegram.status === 'not_configured') {
+            telegramDot.style.background = '#9E9E9E'; // Серая (не настроен)
+        } else {
+            telegramDot.style.background = '#f44336'; // Красная
+        }
+    }
 }
 
 // Загрузка списка термометров
@@ -172,13 +179,20 @@ function renderSensorCells() {
     const enabledSensors = sensors.filter(s => s.enabled);
     
     enabledSensors.forEach(sensor => {
+        // Используем адрес, индекс или id как ключ
+        const sensorKey = sensor.address || sensor.index || sensor.id;
+        
         const cell = document.createElement('div');
         cell.className = 'sensor-cell';
-        cell.onclick = () => openSensorSettings(sensor.id);
-        
-        const sensorData = sensorsData[sensor.id] || {};
+        cell.onclick = () => openSensorSettings(sensorKey);
+        const sensorData = sensorsData[sensorKey] || {};
         const currentTemp = sensorData.currentTemp !== undefined ? sensorData.currentTemp : null;
-        const tempDisplay = currentTemp !== null ? currentTemp.toFixed(1) : '--';
+        // Применяем коррекцию, если она есть
+        const correctedTemp = currentTemp !== null ? (currentTemp + (sensor.correction || 0)) : null;
+        const tempDisplay = correctedTemp !== null ? correctedTemp.toFixed(1) : '--';
+        
+        // Используем имя термометра из настроек
+        const sensorName = sensor.name || `Термометр ${(sensor.index !== undefined ? sensor.index + 1 : 1)}`;
         
         // Название режима
         const modeNames = {
@@ -217,12 +231,12 @@ function renderSensorCells() {
         
         const sendButton = document.createElement('button');
         sendButton.className = `sensor-send-button ${sensor.sendToNetworks ? 'active' : ''}`;
-        sendButton.onclick = (e) => { e.stopPropagation(); toggleSendToNetworks(sensor.id); };
+        sendButton.onclick = (e) => { e.stopPropagation(); toggleSendToNetworks(sensorKey); };
         sendButton.innerHTML = `<span>📤</span><span>${sensor.sendToNetworks ? 'Вкл' : 'Выкл'}</span>`;
         
         const buzzerButton = document.createElement('button');
         buzzerButton.className = `sensor-buzzer-button ${sensor.buzzerEnabled ? 'active' : ''}`;
-        buzzerButton.onclick = (e) => { e.stopPropagation(); toggleBuzzer(sensor.id); };
+        buzzerButton.onclick = (e) => { e.stopPropagation(); toggleBuzzer(sensorKey); };
         const buzzerIcon = sensor.buzzerEnabled ? '🔊' : '🔇';
         buzzerButton.innerHTML = `<span>${buzzerIcon}</span>`;
         
@@ -230,7 +244,7 @@ function renderSensorCells() {
         buttonsContainer.appendChild(buzzerButton);
         
         cell.innerHTML = `
-            <div class="sensor-name">${sensor.name}</div>
+            <div class="sensor-name">${sensorName}</div>
             <div class="sensor-temp-container">
                 <span class="sensor-temp">${tempDisplay}</span>
                 <span class="sensor-temp-unit">°C</span>
@@ -246,15 +260,21 @@ function renderSensorCells() {
 
 // Открытие модального окна настроек
 function openSensorSettings(sensorId) {
-    const sensor = sensors.find(s => s.id === sensorId);
+    // Ищем по адресу, индексу или id
+    const sensor = sensors.find(s => (s.address === sensorId || s.index === sensorId || s.id === sensorId));
     if (!sensor) return;
     
     const modal = document.getElementById('sensor-settings-modal');
     if (!modal) return;
     
-    // Заполняем форму данными термометра
-    document.getElementById('modal-sensor-id').value = sensor.id;
+    // Заполняем форму данными термометра (используем адрес или индекс как идентификатор)
+    const sensorKey = sensor.address || sensor.index || sensor.id;
+    document.getElementById('modal-sensor-id').value = sensorKey;
     document.getElementById('modal-sensor-name').textContent = `Настройки: ${sensor.name}`;
+    const nameInput = document.getElementById('modal-sensor-name-input');
+    if (nameInput) {
+        nameInput.value = sensor.name || '';
+    }
     document.getElementById('modal-sensor-mode').value = sensor.mode || 'monitoring';
     document.getElementById('modal-send-to-networks').checked = sensor.sendToNetworks !== false;
     
@@ -273,6 +293,12 @@ function openSensorSettings(sensorId) {
         document.getElementById('modal-stab-duration').value = sensor.stabilizationSettings.duration || 10;
     }
     
+    // Настройки мониторинга
+    const monitoringIntervalInput = document.getElementById('modal-monitoring-interval');
+    if (monitoringIntervalInput) {
+        monitoringIntervalInput.value = sensor.monitoringInterval || 5;
+    }
+    
     // Обновляем видимость настроек режима
     updateSensorModeSettings(sensor.mode || 'monitoring');
     
@@ -289,22 +315,42 @@ function closeSensorSettings() {
 
 // Обновление настроек режима в модальном окне
 function updateSensorModeSettings(mode) {
+    const monitoringSettings = document.getElementById('modal-monitoring-settings');
     const alertSettings = document.getElementById('modal-alert-settings');
     const stabSettings = document.getElementById('modal-stabilization-settings');
     
+    if (monitoringSettings) monitoringSettings.style.display = (mode === 'monitoring') ? 'block' : 'none';
     if (alertSettings) alertSettings.style.display = (mode === 'alert') ? 'block' : 'none';
     if (stabSettings) stabSettings.style.display = (mode === 'stabilization') ? 'block' : 'none';
 }
 
 // Сохранение настроек термометра
 async function saveSensorSettings() {
-    const sensorId = parseInt(document.getElementById('modal-sensor-id').value);
-    const sensor = sensors.find(s => s.id === sensorId);
-    if (!sensor) return;
+    const sensorKey = document.getElementById('modal-sensor-id').value;
+    // Ищем по адресу, индексу или id
+    const sensor = sensors.find(s => (s.address === sensorKey || String(s.index) === sensorKey || String(s.id) === sensorKey));
+    if (!sensor) {
+        console.error('Sensor not found:', sensorKey);
+        return;
+    }
     
     // Обновляем данные термометра
+    const nameInput = document.getElementById('modal-sensor-name-input');
+    if (nameInput && nameInput.value.trim()) {
+        sensor.name = nameInput.value.trim();
+    }
     sensor.mode = document.getElementById('modal-sensor-mode').value;
     sensor.sendToNetworks = document.getElementById('modal-send-to-networks').checked;
+    
+    // Настройки мониторинга
+    if (sensor.mode === 'monitoring') {
+        const monitoringIntervalInput = document.getElementById('modal-monitoring-interval');
+        if (monitoringIntervalInput) {
+            sensor.monitoringInterval = parseInt(monitoringIntervalInput.value) || 5;
+        } else {
+            sensor.monitoringInterval = 5;
+        }
+    }
     
     if (sensor.mode === 'alert') {
         if (!sensor.alertSettings) sensor.alertSettings = {};
@@ -321,19 +367,49 @@ async function saveSensorSettings() {
         sensor.stabilizationSettings.duration = parseInt(document.getElementById('modal-stab-duration').value) || 10;
     }
     
-    // Сохраняем на сервер
+    // Сохраняем на сервер через общий API датчиков
     try {
-        const response = await fetch(`/api/sensor/${sensorId}`, {
+        // Подготавливаем данные для сохранения - убеждаемся, что все поля присутствуют
+        const sensorsToSave = sensors.map(s => ({
+            address: s.address || '',
+            name: s.name || '',
+            enabled: s.enabled !== undefined ? s.enabled : true,
+            correction: s.correction || 0.0,
+            mode: s.mode || 'monitoring',
+            monitoringInterval: s.monitoringInterval || 5,
+            sendToNetworks: s.sendToNetworks !== undefined ? s.sendToNetworks : true,
+            buzzerEnabled: s.buzzerEnabled || false,
+            alertSettings: s.alertSettings || {
+                minTemp: 10.0,
+                maxTemp: 30.0,
+                buzzerEnabled: true
+            },
+            stabilizationSettings: s.stabilizationSettings || {
+                targetTemp: 25.0,
+                tolerance: 0.1,
+                alertThreshold: 0.2,
+                duration: 10
+            }
+        }));
+        
+        // Сохраняем все датчики
+        const response = await fetch('/api/sensors', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(sensor)
+            body: JSON.stringify({ sensors: sensorsToSave })
         });
         
         if (response.ok) {
+            // Перезагружаем данные датчиков с сервера
+            await loadSensors();
+            // Обновляем отображение на главном экране
             renderSensorCells();
+            // Закрываем модальное окно
             closeSensorSettings();
+            // Показываем сообщение об успехе
+            console.log('Настройки термометра сохранены');
         } else {
             alert('Ошибка сохранения настроек');
         }
@@ -345,18 +421,19 @@ async function saveSensorSettings() {
 
 // Переключение отправки данных
 function toggleSendToNetworks(sensorId) {
-    const sensor = sensors.find(s => s.id === sensorId);
+    // Ищем по адресу, индексу или id
+    const sensor = sensors.find(s => (s.address === sensorId || s.index === sensorId || s.id === sensorId));
     if (!sensor) return;
     
     sensor.sendToNetworks = !sensor.sendToNetworks;
     
     // Сохраняем на сервер
-    fetch(`/api/sensor/${sensorId}`, {
+    fetch('/api/sensors', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify(sensor)
+        body: JSON.stringify({ sensors: sensors })
     }).catch(error => {
         console.error('Error saving sensor:', error);
     });
@@ -366,19 +443,19 @@ function toggleSendToNetworks(sensorId) {
 
 // Переключение бипера
 function toggleBuzzer(sensorId) {
-    const sensor = sensors.find(s => s.id === sensorId);
+    // Ищем по адресу, индексу или id
+    const sensor = sensors.find(s => (s.address === sensorId || s.index === sensorId || s.id === sensorId));
     if (!sensor) return;
     
-    if (!sensor.buzzerEnabled) sensor.buzzerEnabled = false;
     sensor.buzzerEnabled = !sensor.buzzerEnabled;
     
     // Сохраняем на сервер
-    fetch(`/api/sensor/${sensorId}`, {
+    fetch('/api/sensors', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify(sensor)
+        body: JSON.stringify({ sensors: sensors })
     }).catch(error => {
         console.error('Error saving sensor:', error);
     });
@@ -463,53 +540,204 @@ function updateChartSensorSelectors() {
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
         checkbox.checked = true;
-        checkbox.value = sensor.id;
+        // Используем адрес как ключ, если есть, иначе индекс или id
+        checkbox.value = sensor.address || sensor.index || sensor.id;
         checkbox.onchange = () => updateChart();
         
         label.appendChild(checkbox);
-        label.appendChild(document.createTextNode(sensor.name));
+        label.appendChild(document.createTextNode(sensor.name || `Термометр ${sensor.index + 1}`));
         container.appendChild(label);
+    });
+}
+
+// Функция определения интервала агрегации данных в зависимости от периода
+function getAggregationInterval(period) {
+    switch(period) {
+        case '1m': return 60; // 1 минута
+        case '5m': return 300; // 5 минут
+        case '15m': return 900; // 15 минут
+        case '30m': return 1800; // 30 минут
+        case '1h': return 3600; // 1 час
+        case '6h': return 21600; // 6 часов
+        case '24h': return 86400; // 24 часа
+        case '7d': return 604800; // 7 дней
+        default: return 3600; // По умолчанию 1 час
+    }
+}
+
+// Функция агрегации данных по интервалам
+function aggregateData(records, intervalSeconds) {
+    if (!records || records.length === 0) return [];
+    
+    const aggregated = [];
+    let currentBucket = null;
+    let bucketStartTime = null;
+    
+    records.forEach(record => {
+        const recordTime = record.timestamp;
+        
+        // Определяем начало текущего бакета
+        const bucketTime = Math.floor(recordTime / intervalSeconds) * intervalSeconds;
+        
+        if (bucketStartTime !== bucketTime) {
+            // Новый бакет
+            if (currentBucket !== null) {
+                aggregated.push(currentBucket);
+            }
+            currentBucket = {
+                timestamp: bucketTime,
+                temperatures: [],
+                sensors: {}
+            };
+            bucketStartTime = bucketTime;
+        }
+        
+        // Добавляем температуру в текущий бакет (пропускаем нулевые и невалидные значения)
+        if (record.temperature !== null && 
+            record.temperature !== undefined && 
+            record.temperature !== 0 && 
+            record.temperature !== -127.0) {
+            currentBucket.temperatures.push(record.temperature);
+            const sensorKey = record.sensor_id || record.sensor_address || 'default';
+            if (!currentBucket.sensors[sensorKey]) {
+                currentBucket.sensors[sensorKey] = [];
+            }
+            currentBucket.sensors[sensorKey].push(record.temperature);
+        }
+    });
+    
+    // Добавляем последний бакет
+    if (currentBucket !== null) {
+        aggregated.push(currentBucket);
+    }
+    
+    // Вычисляем средние значения для каждого бакета
+    return aggregated.map(bucket => {
+        const result = {
+            timestamp: bucket.timestamp,
+            sensors: {}
+        };
+        
+        // Среднее по всем датчикам
+        if (bucket.temperatures.length > 0) {
+            const sum = bucket.temperatures.reduce((a, b) => a + b, 0);
+            result.average = sum / bucket.temperatures.length;
+        }
+        
+        // Среднее по каждому датчику
+        Object.keys(bucket.sensors).forEach(sensorKey => {
+            const temps = bucket.sensors[sensorKey];
+            if (temps.length > 0) {
+                const sum = temps.reduce((a, b) => a + b, 0);
+                result.sensors[sensorKey] = sum / temps.length;
+            }
+        });
+        
+        return result;
     });
 }
 
 // Функция загрузки графика
 async function loadChart(period) {
     currentChartPeriod = period;
+    chartZoom = { min: null, max: null }; // Сбрасываем масштаб при смене периода
+    chartPan = { offset: 0 }; // Сбрасываем смещение
     
-    // Получаем выбранные термометры
+    // Получаем выбранные термометры (используем адрес или индекс)
     const selectedCheckboxes = document.querySelectorAll('#chart-sensors-select input[type="checkbox"]:checked');
-    const selectedSensorIds = Array.from(selectedCheckboxes).map(cb => parseInt(cb.value));
+    const selectedSensorKeys = Array.from(selectedCheckboxes).map(cb => cb.value);
     
-    if (selectedSensorIds.length === 0) {
-        selectedSensorIds.push(...sensors.filter(s => s.enabled).map(s => s.id));
+    if (selectedSensorKeys.length === 0) {
+        // Выбираем все включенные термометры по адресу или индексу
+        selectedSensorKeys.push(...sensors.filter(s => s.enabled).map(s => s.address || s.index || s.id));
     }
     
     try {
-        const response = await fetch(`/api/temperature/history?period=${period}`);
+        // Определяем период для запроса
+        let periodParam = period;
+        if (period === '1m' || period === '5m' || period === '15m' || period === '30m') {
+            periodParam = '1h'; // Для коротких периодов запрашиваем данные за час
+        }
+        
+        const response = await fetch(`/api/temperature/history?period=${periodParam}`);
         const data = await response.json();
         
         if (data.data && data.data.length > 0) {
+            // Агрегируем данные в зависимости от периода
+            const intervalSeconds = getAggregationInterval(period);
+            const aggregated = aggregateData(data.data, intervalSeconds);
+            
+            // Применяем смещение для прокрутки
+            let displayData = aggregated;
+            if (chartPan.offset > 0 && chartPan.offset < aggregated.length) {
+                displayData = aggregated.slice(chartPan.offset);
+            }
+            
             const labels = [];
             const datasets = [];
             
             // Группируем данные по термометрам
             const sensorDataMap = {};
-            selectedSensorIds.forEach(id => {
-                sensorDataMap[id] = [];
+            selectedSensorKeys.forEach(key => {
+                sensorDataMap[key] = [];
             });
             
-            data.data.forEach(record => {
-                const date = new Date(record.timestamp * 1000);
-                const timeLabel = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+            displayData.forEach(bucket => {
+                const date = new Date(bucket.timestamp * 1000);
+                let timeLabel;
                 
-                if (!labels.includes(timeLabel)) {
-                    labels.push(timeLabel);
+                // Форматируем метку времени в зависимости от периода
+                if (period === '1m' || period === '5m') {
+                    timeLabel = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                } else if (period === '15m' || period === '30m') {
+                    timeLabel = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                } else if (period === '1h') {
+                    timeLabel = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                } else if (period === '6h') {
+                    timeLabel = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                } else if (period === '24h') {
+                    timeLabel = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+                } else {
+                    timeLabel = date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' }) + ' ' + 
+                               date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
                 }
                 
-                if (record.sensor_id && sensorDataMap[record.sensor_id]) {
-                    const index = labels.indexOf(timeLabel);
-                    sensorDataMap[record.sensor_id][index] = record.temperature;
-                }
+                labels.push(timeLabel);
+                
+                // Заполняем данные для каждого датчика
+                // Заполняем данные для каждого выбранного датчика
+                selectedSensorKeys.forEach(key => {
+                    if (!sensorDataMap[key]) {
+                        sensorDataMap[key] = [];
+                    }
+                    
+                    // Ищем данные для этого датчика в бакете
+                    // Проверяем точное совпадение ключа
+                    let temp = bucket.sensors[key];
+                    
+                    // Если не найдено, ищем по адресу термометра
+                    if (temp === undefined) {
+                        const sensor = sensors.find(s => 
+                            (s.address === key || String(s.index) === key || String(s.id) === key)
+                        );
+                        if (sensor && sensor.address) {
+                            // Пробуем найти по адресу
+                            temp = bucket.sensors[sensor.address];
+                        }
+                    }
+                    
+                    // Заполняем массив до текущей позиции null, если нужно
+                    while (sensorDataMap[key].length < labels.length - 1) {
+                        sensorDataMap[key].push(null);
+                    }
+                    
+                    // Добавляем температуру или null (пропускаем нулевые значения)
+                    if (temp !== undefined && temp !== null && temp !== 0 && temp !== -127.0) {
+                        sensorDataMap[key].push(temp);
+                    } else {
+                        sensorDataMap[key].push(null);
+                    }
+                });
             });
             
             // Создаем датасеты для каждого термометра
@@ -522,25 +750,55 @@ async function loadChart(period) {
             ];
             
             let colorIndex = 0;
-            selectedSensorIds.forEach(id => {
-                const sensor = sensors.find(s => s.id === id);
+            selectedSensorKeys.forEach(key => {
+                // Ищем датчик по адресу, индексу или id
+                const sensor = sensors.find(s => (s.address === key || s.index === key || s.id === key));
                 if (sensor) {
                     const color = colors[colorIndex % colors.length];
                     datasets.push({
-                        label: sensor.name,
-                        data: sensorDataMap[id],
+                        label: sensor.name || `Термометр ${sensor.index + 1}`,
+                        data: sensorDataMap[key] || [],
                         borderColor: color.border,
                         backgroundColor: color.bg,
                         tension: 0.4,
-                        fill: true
+                        fill: true,
+                        spanGaps: true // Пропускаем пропуски в данных
                     });
                     colorIndex++;
                 }
             });
             
+            // Если нет данных, показываем сообщение
+            if (labels.length === 0) {
+                labels.push('Нет данных');
+                datasets.push({
+                    label: 'Нет данных',
+                    data: [null],
+                    borderColor: 'rgba(0, 0, 0, 0.1)',
+                    backgroundColor: 'rgba(0, 0, 0, 0.05)'
+                });
+            }
+            
+            // Настройки масштаба
+            const yAxisOptions = {
+                beginAtZero: false,
+                title: {
+                    display: true,
+                    text: 'Температура (°C)'
+                }
+            };
+            
+            if (chartZoom.min !== null) {
+                yAxisOptions.min = chartZoom.min;
+            }
+            if (chartZoom.max !== null) {
+                yAxisOptions.max = chartZoom.max;
+            }
+            
             if (temperatureChart) {
                 temperatureChart.data.labels = labels;
                 temperatureChart.data.datasets = datasets;
+                temperatureChart.options.scales.y = yAxisOptions;
                 temperatureChart.update();
             } else {
                 const ctx = document.getElementById('temperatureChart').getContext('2d');
@@ -553,20 +811,36 @@ async function loadChart(period) {
                     options: {
                         responsive: true,
                         maintainAspectRatio: true,
+                        interaction: {
+                            mode: 'index',
+                            intersect: false
+                        },
                         plugins: {
                             legend: {
                                 display: true,
                                 position: 'top'
+                            },
+                            zoom: {
+                                zoom: {
+                                    wheel: {
+                                        enabled: true
+                                    },
+                                    pinch: {
+                                        enabled: true
+                                    },
+                                    mode: 'xy',
+                                    limits: {
+                                        y: { min: -50, max: 100 }
+                                    }
+                                },
+                                pan: {
+                                    enabled: true,
+                                    mode: 'x'
+                                }
                             }
                         },
                         scales: {
-                            y: {
-                                beginAtZero: false,
-                                title: {
-                                    display: true,
-                                    text: 'Температура (°C)'
-                                }
-                            },
+                            y: yAxisOptions,
                             x: {
                                 title: {
                                     display: true,
@@ -586,6 +860,16 @@ async function loadChart(period) {
 // Функция обновления графика
 function updateChart() {
     loadChart(currentChartPeriod);
+}
+
+// Функция сброса масштаба графика
+function resetChartZoom() {
+    chartZoom = { min: null, max: null };
+    chartPan = { offset: 0 };
+    if (temperatureChart) {
+        temperatureChart.resetZoom();
+        loadChart(currentChartPeriod);
+    }
 }
 
 // Функция инициализации

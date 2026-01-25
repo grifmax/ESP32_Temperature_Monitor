@@ -12,8 +12,31 @@
 #include "mqtt_client.h"
 #include "operation_modes.h"
 #include "web_server.h"
+#include "sensors.h"
 #include "display.h"
 #include "buzzer.h"
+
+// Forward declaration для доступа к кешу настроек из main.cpp
+struct SensorConfig {
+  String address;
+  String name;
+  bool enabled;
+  float correction;
+  String mode;
+  bool sendToNetworks;
+  bool buzzerEnabled;
+  float alertMinTemp;
+  float alertMaxTemp;
+  bool alertBuzzerEnabled;
+  float stabTargetTemp;
+  float stabTolerance;
+  float stabAlertThreshold;
+  unsigned long stabDuration;
+  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
+  bool valid;
+};
+extern SensorConfig sensorConfigs[];
+extern int sensorConfigCount;
 
 extern float currentTemp;
 extern unsigned long deviceUptime;
@@ -42,6 +65,12 @@ struct TelegramMessage {
 // Очередь для Telegram сообщений
 QueueHandle_t telegramQueue = NULL;
 bool telegramSendInProgress = false;
+unsigned long lastTelegramSendAttempt = 0;
+unsigned long lastTelegramSendSuccess = 0;
+const unsigned long TELEGRAM_SEND_INTERVAL = 2000; // Минимум 2 секунды между отправками
+const unsigned long TELEGRAM_SEND_TIMEOUT = 5000; // Таймаут отправки 5 секунд
+int telegramConsecutiveFailures = 0;
+const int MAX_TELEGRAM_FAILURES = 3; // После 3 неудач подряд - пауза
 
 static void updateTelegramFlags() {
   telegramConfigured = telegramBotToken.length() > 0;
@@ -57,6 +86,7 @@ void ensureTelegramBot() {
       bot = nullptr;
     }
     telegramActiveToken = "";
+    Serial.println(F("Telegram: Bot not configured"));
     return;
   }
   if (!bot || telegramActiveToken != telegramBotToken) {
@@ -65,6 +95,7 @@ void ensureTelegramBot() {
     }
     bot = new UniversalTelegramBot(telegramBotToken, secured_client);
     telegramActiveToken = telegramBotToken;
+    Serial.println(F("Telegram: Bot initialized"));
   }
   telegramInitialized = true;
 }
@@ -88,6 +119,14 @@ static void sendTelegramMessageToQueue(const String& chatId, const String& messa
     }
   }
   
+  // Проверяем, не слишком ли много неудач подряд
+  if (telegramConsecutiveFailures >= MAX_TELEGRAM_FAILURES) {
+    unsigned long now = millis();
+    if (now - lastTelegramSendAttempt < 30000) { // 30 секунд паузы
+      return; // Слишком много неудач, не добавляем в очередь
+    }
+  }
+  
   TelegramMessage* msg = new TelegramMessage();
   msg->chatId = chatId;
   msg->message = message;
@@ -95,19 +134,22 @@ static void sendTelegramMessageToQueue(const String& chatId, const String& messa
   
   if (xQueueSend(telegramQueue, &msg, 0) != pdTRUE) {
     delete msg; // Очередь переполнена
-    Serial.println(F("Telegram queue is full, message dropped"));
-  } else {
-    Serial.print(F("Message queued for chat: "));
-    Serial.print(chatId);
-    Serial.print(F(", length: "));
-    Serial.println(message.length());
+    // Не логируем каждое сообщение, чтобы не засорять Serial
   }
 }
 
 // Обработка очереди Telegram сообщений (вызывается из loop())
 void processTelegramQueue() {
-  if (telegramQueue == NULL || telegramSendInProgress) {
-    return;
+  // Проверяем, что очередь инициализирована
+  if (telegramQueue == NULL) {
+    initTelegramQueue();
+    if (telegramQueue == NULL) {
+      return;
+    }
+  }
+  
+  if (telegramSendInProgress) {
+    return; // Уже отправляем сообщение
   }
   
   TelegramMessage* msg = NULL;
@@ -116,7 +158,7 @@ void processTelegramQueue() {
     
     telegramSendInProgress = true;
     
-    // Проверяем подключение WiFi
+    // Проверяем подключение WiFi - критически важно перед любыми DNS запросами
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram queue: WiFi not connected, skipping message"));
       delete msg;
@@ -124,9 +166,27 @@ void processTelegramQueue() {
       return;
     }
     
+    // Дополнительная проверка стабильности WiFi перед DNS запросами
+    // Проверяем, что WiFi действительно подключен и стабилен
+    static unsigned long lastWiFiCheck = 0;
+    unsigned long now = millis();
+    if (now - lastWiFiCheck > 1000) { // Проверяем не чаще раза в секунду
+      if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+        Serial.println(F("Telegram queue: WiFi unstable, skipping message"));
+        delete msg;
+        telegramSendInProgress = false;
+        return;
+      }
+      lastWiFiCheck = now;
+    }
+    
     ensureTelegramBot();
+    updateTelegramFlags(); // Обновляем флаги перед проверкой
     if (!telegramCanSend) {
-      Serial.println(F("Telegram queue: Telegram not configured"));
+      Serial.print(F("Telegram queue: Cannot send - configured="));
+      Serial.print(telegramConfigured);
+      Serial.print(F(", chatId="));
+      Serial.println(telegramChatId.length() > 0 ? telegramChatId : "(empty)");
       delete msg;
       telegramSendInProgress = false;
       return;
@@ -139,34 +199,140 @@ void processTelegramQueue() {
       return;
     }
     
-    Serial.print(F("Telegram queue: Sending message to chat "));
+    // Проверяем интервал между отправками
+    now = millis(); // Используем уже объявленную переменную
+    if (now - lastTelegramSendAttempt < TELEGRAM_SEND_INTERVAL) {
+      // Слишком рано, возвращаем сообщение в очередь
+      xQueueSendToFront(telegramQueue, &msg, 0);
+      telegramSendInProgress = false;
+      return;
+    }
+    
+    // Проверяем, не слишком ли много неудач подряд
+    if (telegramConsecutiveFailures >= MAX_TELEGRAM_FAILURES) {
+      // Слишком много неудач, делаем паузу
+      if (now - lastTelegramSendAttempt < 30000) { // 30 секунд паузы
+        delete msg;
+        telegramSendInProgress = false;
+        Serial.println(F("Telegram: Too many failures, pausing"));
+        return;
+      } else {
+        // Пауза прошла, сбрасываем счетчик
+        telegramConsecutiveFailures = 0;
+      }
+    }
+    
+    lastTelegramSendAttempt = now;
+    
+    // Дополнительная проверка WiFi перед отправкой
+    if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+      Serial.println(F("Telegram: WiFi unstable before send, skipping"));
+      delete msg;
+      telegramSendInProgress = false;
+      telegramConsecutiveFailures++;
+      return;
+    }
+    
+    Serial.print(F("Telegram: Sending to chat "));
     Serial.print(msg->chatId);
-    Serial.print(F(", length: "));
+    Serial.print(F(", len: "));
     Serial.println(msg->message.length());
     
     // Используем Markdown для форматирования сообщений
-    // Если Markdown не работает, можно попробовать "HTML" или убрать форматирование ""
     String parseMode = "Markdown";
+    unsigned long sendStart = millis();
+    
+    // Добавляем watchdog feed перед длительной операцией
+    yield(); // Даем время другим задачам
+    
+    // Проверяем WiFi еще раз перед отправкой (DNS lookup может быть проблемным)
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("Telegram: WiFi disconnected before send, skipping"));
+      delete msg;
+      telegramSendInProgress = false;
+      telegramConsecutiveFailures++;
+      return;
+    }
+    
+    // Пытаемся отправить с обработкой ошибок DNS
+    // Проверяем WiFi еще раз перед отправкой
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("Telegram: WiFi disconnected before send, skipping"));
+      delete msg;
+      telegramSendInProgress = false;
+      telegramConsecutiveFailures++;
+      return;
+    }
+    
     bool success = bot->sendMessage(msg->chatId, msg->message, parseMode);
+    
+    // Проверяем, не отключился ли WiFi после отправки
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("Telegram: WiFi disconnected after send attempt"));
+      success = false;
+    }
+    
+    unsigned long sendDuration = millis() - sendStart;
+    
+    // Проверяем таймаут и прерываем, если слишком долго
+    if (sendDuration > TELEGRAM_SEND_TIMEOUT) {
+      Serial.print(F("Telegram: Send took "));
+      Serial.print(sendDuration);
+      Serial.println(F(" ms (slow)"));
+      // Если отправка заняла слишком много времени, считаем неудачей
+      if (sendDuration > 10000) { // 10 секунд - критический таймаут
+        success = false;
+        Serial.println(F("Telegram: Critical timeout, marking as failed"));
+      }
+    }
+    
+    yield(); // Даем время после отправки
     
     if (msg->isTestMessage) {
       if (success) {
-        Serial.println(F("Telegram test message sent successfully"));
+        Serial.println(F("Telegram test: OK"));
+        telegramConsecutiveFailures = 0;
+        lastTelegramSendSuccess = now;
       } else {
-        Serial.println(F("Telegram test message failed - check bot token and chat ID"));
-        // Попробуем отправить без форматирования
-        Serial.println(F("Trying to send without formatting..."));
-        success = bot->sendMessage(msg->chatId, msg->message, "");
-        Serial.println(success ? F("Message sent without formatting") : F("Still failed"));
+        Serial.println(F("Telegram test: FAILED"));
+        telegramConsecutiveFailures++;
+        // Попробуем отправить без форматирования только один раз
+        if (telegramConsecutiveFailures == 1) {
+          sendStart = millis();
+          success = bot->sendMessage(msg->chatId, msg->message, "");
+          sendDuration = millis() - sendStart;
+          if (success) {
+            Serial.println(F("Telegram test: OK (no format)"));
+            telegramConsecutiveFailures = 0;
+            lastTelegramSendSuccess = now;
+          } else {
+            Serial.println(F("Telegram test: Still failed"));
+            telegramConsecutiveFailures++;
+          }
+        }
       }
     } else {
       if (success) {
-        Serial.println(F("Telegram message sent"));
+        Serial.println(F("Telegram: Sent"));
+        telegramConsecutiveFailures = 0;
+        lastTelegramSendSuccess = now;
       } else {
-        Serial.println(F("Telegram message failed - trying without formatting..."));
-        // Попробуем отправить без форматирования, если Markdown не работает
-        success = bot->sendMessage(msg->chatId, msg->message, "");
-        Serial.println(success ? F("Message sent without formatting") : F("Still failed"));
+        Serial.println(F("Telegram: Failed"));
+        telegramConsecutiveFailures++;
+        // Попробуем отправить без форматирования только один раз
+        if (telegramConsecutiveFailures == 1) {
+          sendStart = millis();
+          success = bot->sendMessage(msg->chatId, msg->message, "");
+          sendDuration = millis() - sendStart;
+          if (success) {
+            Serial.println(F("Telegram: Sent (no format)"));
+            telegramConsecutiveFailures = 0;
+            lastTelegramSendSuccess = now;
+          } else {
+            Serial.println(F("Telegram: Still failed"));
+            telegramConsecutiveFailures++;
+          }
+        }
       }
     }
     
@@ -180,6 +346,8 @@ void startTelegramBot() {
   // Для ESP32 можно использовать setInsecure() для тестирования
   // В продакшене следует использовать setCACert() с правильным сертификатом
   secured_client.setInsecure(); // Используется для тестирования
+  // Устанавливаем таймауты для предотвращения зависаний
+  secured_client.setTimeout(5); // 5 секунд таймаут для подключения
   ensureTelegramBot();
   initTelegramQueue(); // Инициализируем очередь
   if (telegramConfigured) {
@@ -190,15 +358,48 @@ void startTelegramBot() {
 }
 
 void handleTelegramMessages() {
+  // Проверяем WiFi перед любыми операциями с Telegram
+  if (WiFi.status() != WL_CONNECTED) {
+    telegramLastPollOk = false;
+    return;
+  }
+  
+  // Дополнительная проверка стабильности WiFi
+  if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+    telegramLastPollOk = false;
+    return;
+  }
+  
   ensureTelegramBot();
   if (!bot || !telegramConfigured) {
+    return;
+  }
+
+  // Проверяем WiFi еще раз перед getUpdates (может быть DNS lookup)
+  if (WiFi.status() != WL_CONNECTED) {
+    telegramLastPollOk = false;
     return;
   }
 
   // Используем offset для получения только новых сообщений
   // last_message_received содержит ID последнего обработанного сообщения
   // Передаем last_message_received + 1, чтобы получить только новые сообщения
-  int numNewMessages = bot->getUpdates(bot->last_message_received + 1);
+  int numNewMessages = -1;
+  // Проверяем WiFi еще раз перед getUpdates
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0)) {
+    numNewMessages = bot->getUpdates(bot->last_message_received + 1);
+  } else {
+    Serial.println(F("Telegram: WiFi unstable, skipping getUpdates"));
+    numNewMessages = -1;
+  }
+  
+  // Проверяем, не отключился ли WiFi после getUpdates
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("Telegram: WiFi disconnected after getUpdates"));
+    telegramLastPollOk = false;
+    return;
+  }
+  
   telegramLastPollMs = millis();
   telegramLastPollOk = (numNewMessages >= 0);
   
@@ -291,7 +492,82 @@ void handleTelegramMessages() {
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command == "/status" || command == "/temp" || command == "status" || command == "temp") {
-      String message = "🌡️ *Температура:* " + String(currentTemp, 1) + "°C";
+      String message = "📊 *Статус устройства*\n\n";
+      
+      // Информация о термометрах
+      int sensorCount = getSensorCount();
+      message += "🌡️ *Термометры:* " + String(sensorCount) + "\n\n";
+      
+      // Загружаем настройки термометров для получения имен и режимов
+      String settingsJson = getSettings();
+      StaticJsonDocument<4096> doc;
+      DeserializationError error = deserializeJson(doc, settingsJson);
+      
+      if (!error && doc["sensors"].is<JsonArray>()) {
+        JsonArray sensors = doc["sensors"].as<JsonArray>();
+        
+        // Создаем карту настроек по адресу
+        StaticJsonDocument<2048> sensorsMapDoc;
+        JsonObject sensorsMap = sensorsMapDoc.to<JsonObject>();
+        for (JsonObject sensor : sensors) {
+          String addr = sensor["address"].as<String>();
+          if (addr.length() > 0) {
+            sensorsMap[addr] = sensor;
+          }
+        }
+        
+        // Выводим информацию о каждом термометре
+        for (int i = 0; i < sensorCount; i++) {
+          String addressStr = getSensorAddressString(i);
+          float temp = getSensorTemperature(i);
+          
+          message += "🌡️ *Термометр " + String(i + 1) + "*\n";
+          
+          // Ищем настройки по адресу
+          if (sensorsMap[addressStr].is<JsonObject>()) {
+            JsonObject sensorSettings = sensorsMap[addressStr];
+            String name = sensorSettings["name"].as<String>();
+            if (name.length() == 0) {
+              name = "Термометр " + String(i + 1);
+            }
+            String mode = sensorSettings["mode"].as<String>();
+            if (mode.length() == 0) {
+              mode = "monitoring";
+            }
+            bool enabled = sensorSettings["enabled"] | true;
+            
+            message += "   📝 *Имя:* " + name + "\n";
+            message += "   ⚙️ *Режим:* ";
+            if (mode == "monitoring") {
+              message += "Мониторинг\n";
+            } else if (mode == "alert") {
+              message += "Оповещение\n";
+            } else if (mode == "stabilization") {
+              message += "Стабилизация\n";
+            } else {
+              message += mode + "\n";
+            }
+            message += "   ✅ *Статус:* " + String(enabled ? "Включен" : "Выключен") + "\n";
+          } else {
+            message += "   📝 *Имя:* Термометр " + String(i + 1) + "\n";
+            message += "   ⚙️ *Режим:* Мониторинг\n";
+            message += "   ✅ *Статус:* Включен\n";
+          }
+          
+          message += "   🌡️ *Температура:* " + String(temp != -127.0 ? String(temp, 1) : "Ошибка") + "°C\n";
+          message += "   🔗 *Адрес:* `" + addressStr + "`\n\n";
+        }
+      } else {
+        // Если не удалось загрузить настройки, показываем базовую информацию
+        for (int i = 0; i < sensorCount; i++) {
+          String addressStr = getSensorAddressString(i);
+          float temp = getSensorTemperature(i);
+          message += "🌡️ *Термометр " + String(i + 1) + "*\n";
+          message += "   🌡️ *Температура:* " + String(temp != -127.0 ? String(temp, 1) : "Ошибка") + "°C\n";
+          message += "   🔗 *Адрес:* `" + addressStr + "`\n\n";
+        }
+      }
+      
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command == "/sensors" || command == "sensors") {
@@ -591,21 +867,82 @@ void handleTelegramMessages() {
 }
 
 void sendMetricsToTelegram() {
+  sendMetricsToTelegram("", currentTemp);
+}
+
+void sendMetricsToTelegram(const String& sensorName, float temperature) {
   if (WiFi.status() != WL_CONNECTED) {
     return; // WiFi не подключен
   }
   
   ensureTelegramBot();
+  updateTelegramFlags();
+  
   if (!telegramCanSend) {
     return; // Telegram не настроен
+  }
+  
+  // Проверяем, не слишком ли много неудач подряд
+  if (telegramConsecutiveFailures >= MAX_TELEGRAM_FAILURES) {
+    unsigned long now = millis();
+    if (now - lastTelegramSendAttempt < 30000) { // 30 секунд паузы
+      return; // Слишком много неудач, пропускаем
+    }
   }
   
   unsigned long hours = deviceUptime / 3600;
   unsigned long minutes = (deviceUptime % 3600) / 60;
   
-  String message = "📊 Метрики устройства:\n\n";
-  message += "🌡️ Температура: " + String(currentTemp, 1) + "°C\n";
-  message += "🌐 IP: " + deviceIP + "\n";
+  String message = "📊 *Метрики устройства*\n\n";
+  
+  // Если указано имя термометра, отправляем только его
+  if (sensorName.length() > 0) {
+    message += "🌡️ " + sensorName + ": " + String(temperature, 1) + "°C\n";
+  } else {
+    // Если имя не указано, собираем все термометры
+    // Используем кеш настроек из main.cpp вместо загрузки из файла каждый раз
+    int sensorCount = getSensorCount();
+    if (sensorCount > 0) {
+      // Добавляем информацию о каждом термометре из кеша
+      for (int i = 0; i < sensorCount; i++) {
+        String addressStr = getSensorAddressString(i);
+        float temp = getSensorTemperature(i);
+        
+        if (temp == -127.0) {
+          continue; // Пропускаем невалидные температуры
+        }
+        
+        // Ищем настройки в кеше
+        String name = "Термометр " + String(i + 1);
+        float correction = 0.0;
+        bool enabled = true;
+        
+        for (int j = 0; j < sensorConfigCount; j++) {
+          if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
+            name = sensorConfigs[j].name;
+            correction = sensorConfigs[j].correction;
+            enabled = sensorConfigs[j].enabled;
+            break;
+          }
+        }
+        
+        if (!enabled) {
+          continue; // Пропускаем выключенные термометры
+        }
+        
+        // Применяем коррекцию
+        float correctedTemp = temp + correction;
+        message += "🌡️ " + name + ": " + String(correctedTemp, 1) + "°C\n";
+        
+        yield(); // Даем время другим задачам
+      }
+    } else {
+      // Если термометров нет, используем старую логику
+      message += "🌡️ Температура: " + String(temperature, 1) + "°C\n";
+    }
+  }
+  
+  message += "\n🌐 IP: " + deviceIP + "\n";
   message += "⏱️ Время работы: " + String(hours) + "ч " + String(minutes) + "м\n";
   message += "📶 Wi-Fi RSSI: " + String(wifiRSSI) + " dBm";
   
@@ -614,17 +951,51 @@ void sendMetricsToTelegram() {
 }
 
 void sendTemperatureAlert(float temperature) {
+  sendTemperatureAlert("", temperature, "");
+}
+
+void sendTemperatureAlert(const String& sensorName, float temperature, const String& alertType) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return; // WiFi не подключен
+  }
+  
   ensureTelegramBot();
+  updateTelegramFlags();
+  
   if (!telegramCanSend) {
     return; // Telegram не настроен
   }
   
-  String alert = "⚠️ *Температурное оповещение*\n\n";
-  if (temperature >= HIGH_TEMP_THRESHOLD) {
-    alert += "🔥 *Высокая температура!*\n";
-  } else if (temperature <= LOW_TEMP_THRESHOLD) {
-    alert += "❄️ *Низкая температура!*\n";
+  // Проверяем, не слишком ли много неудач подряд
+  if (telegramConsecutiveFailures >= MAX_TELEGRAM_FAILURES) {
+    unsigned long now = millis();
+    if (now - lastTelegramSendAttempt < 30000) { // 30 секунд паузы
+      return; // Слишком много неудач, пропускаем
+    }
   }
+  
+  String alert = "⚠️ *Температурное оповещение*\n\n";
+  if (sensorName.length() > 0) {
+    alert += "🌡️ " + sensorName + "\n";
+  }
+  
+  if (alertType.length() > 0) {
+    if (alertType == "high") {
+      alert += "🔥 *Высокая температура!*\n";
+    } else if (alertType == "low") {
+      alert += "❄️ *Низкая температура!*\n";
+    } else {
+      alert += alertType + "\n";
+    }
+  } else {
+    // Старая логика для обратной совместимости
+    if (temperature >= HIGH_TEMP_THRESHOLD) {
+      alert += "🔥 *Высокая температура!*\n";
+    } else if (temperature <= LOW_TEMP_THRESHOLD) {
+      alert += "❄️ *Низкая температура!*\n";
+    }
+  }
+  
   alert += "🌡️ Температура: " + String(temperature, 1) + "°C\n";
   alert += "⏰ Время: " + String(millis() / 1000) + "с";
   
@@ -658,7 +1029,17 @@ bool sendTelegramTestMessage() {
 void setTelegramConfig(const String& token, const String& chatId) {
   telegramBotToken = token;
   telegramChatId = chatId;
+  updateTelegramFlags();
   ensureTelegramBot();
+  
+  Serial.print(F("Telegram config set: token="));
+  Serial.print(telegramBotToken.length() > 0 ? "***" : "(empty)");
+  Serial.print(F(", chatId="));
+  Serial.print(telegramChatId.length() > 0 ? telegramChatId : "(empty)");
+  Serial.print(F(", configured="));
+  Serial.print(telegramConfigured);
+  Serial.print(F(", canSend="));
+  Serial.println(telegramCanSend);
 }
 
 bool isTelegramConfigured() {
