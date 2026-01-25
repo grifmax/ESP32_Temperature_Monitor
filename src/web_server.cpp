@@ -177,25 +177,27 @@ void startWebServer() {
     DeserializationError settingsError = deserializeJson(settingsDoc, settingsJson);
     
     // Создаем карту сохраненных настроек по адресу
-    JsonObject savedSensorsMap;
+    StaticJsonDocument<1024> sensorsMapDoc;
+    JsonObject savedSensorsMap = sensorsMapDoc.to<JsonObject>();
     if (!settingsError && settingsDoc.containsKey("sensors") && settingsDoc["sensors"].is<JsonArray>()) {
       JsonArray savedSensors = settingsDoc["sensors"].as<JsonArray>();
       for (JsonObject savedSensor : savedSensors) {
         String savedAddress = savedSensor["address"] | "";
         if (savedAddress.length() > 0) {
           if (!savedSensorsMap.containsKey(savedAddress)) {
-            savedSensorsMap = savedSensorsMap.createNestedObject(savedAddress);
-            savedSensorsMap["name"] = savedSensor["name"] | "";
-            savedSensorsMap["enabled"] = savedSensor["enabled"] | true;
-            savedSensorsMap["correction"] = savedSensor["correction"] | 0.0;
-            savedSensorsMap["mode"] = savedSensor["mode"] | "monitoring";
-            savedSensorsMap["sendToNetworks"] = savedSensor["sendToNetworks"] | true;
-            savedSensorsMap["buzzerEnabled"] = savedSensor["buzzerEnabled"] | false;
+            JsonObject sensorMap = savedSensorsMap.createNestedObject(savedAddress);
+            sensorMap["name"] = savedSensor["name"] | "";
+            sensorMap["enabled"] = savedSensor["enabled"] | true;
+            sensorMap["correction"] = savedSensor["correction"] | 0.0;
+            sensorMap["mode"] = savedSensor["mode"] | "monitoring";
+            sensorMap["monitoringInterval"] = savedSensor["monitoringInterval"] | 5;
+            sensorMap["sendToNetworks"] = savedSensor["sendToNetworks"] | true;
+            sensorMap["buzzerEnabled"] = savedSensor["buzzerEnabled"] | false;
             if (savedSensor.containsKey("alertSettings")) {
-              savedSensorsMap["alertSettings"] = savedSensor["alertSettings"];
+              sensorMap["alertSettings"] = savedSensor["alertSettings"];
             }
             if (savedSensor.containsKey("stabilizationSettings")) {
-              savedSensorsMap["stabilizationSettings"] = savedSensor["stabilizationSettings"];
+              sensorMap["stabilizationSettings"] = savedSensor["stabilizationSettings"];
             }
           }
         }
@@ -231,9 +233,18 @@ void startWebServer() {
           
           if (saved.containsKey("alertSettings")) {
             sensor["alertSettings"] = saved["alertSettings"];
+          } else {
+            sensor["alertSettings"]["minTemp"] = 10.0;
+            sensor["alertSettings"]["maxTemp"] = 30.0;
+            sensor["alertSettings"]["buzzerEnabled"] = true;
           }
           if (saved.containsKey("stabilizationSettings")) {
             sensor["stabilizationSettings"] = saved["stabilizationSettings"];
+          } else {
+            sensor["stabilizationSettings"]["targetTemp"] = 25.0;
+            sensor["stabilizationSettings"]["tolerance"] = 0.1;
+            sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
+            sensor["stabilizationSettings"]["duration"] = 10;
           }
         } else {
           // Настройки по умолчанию

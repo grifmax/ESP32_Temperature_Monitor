@@ -134,9 +134,12 @@ function updateServiceStatusDots(mqtt, telegram) {
 async function loadSensors() {
     try {
         const response = await fetch('/api/sensors');
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
         const data = await response.json();
         sensors = data.sensors || [];
-        
+
         // Если нет термометров, создаем один по умолчанию
         if (sensors.length === 0) {
             sensors = [{
@@ -161,11 +164,25 @@ async function loadSensors() {
                 }
             }];
         }
-        
+
         renderSensorCells();
         updateChartSensorSelectors();
     } catch (error) {
         console.error('Error loading sensors:', error);
+        // При ошибке создаём дефолтный датчик, чтобы интерфейс не был пустым
+        sensors = [{
+            id: 1,
+            name: 'Термометр 1',
+            enabled: true,
+            correction: 0.0,
+            mode: 'monitoring',
+            sendToNetworks: true,
+            buzzerEnabled: false,
+            alertSettings: { minTemp: 10.0, maxTemp: 30.0, buzzerEnabled: true },
+            stabilizationSettings: { targetTemp: 25.0, tolerance: 0.1, alertThreshold: 0.2, duration: 10, buzzerEnabled: true }
+        }];
+        renderSensorCells();
+        updateChartSensorSelectors();
     }
 }
 
@@ -639,6 +656,12 @@ function aggregateData(records, intervalSeconds) {
 
 // Функция загрузки графика
 async function loadChart(period) {
+    // Проверяем доступность Chart.js
+    if (typeof Chart === 'undefined') {
+        console.warn('Chart.js not available - skipping chart load');
+        return;
+    }
+
     currentChartPeriod = period;
     chartZoom = { min: null, max: null }; // Сбрасываем масштаб при смене периода
     chartPan = { offset: 0 }; // Сбрасываем смещение
@@ -873,20 +896,32 @@ function resetChartZoom() {
 }
 
 // Функция инициализации
-function init() {
-    // Загружаем список термометров
-    loadSensors();
-    
-    // Первая загрузка данных
-    fetchData();
-    
-    // Загрузка графика
-    loadChart('24h');
-    
+async function init() {
+    // Сначала загружаем список термометров и ждём завершения
+    // Это критически важно - без списка сенсоров плитки не отрисуются
+    await loadSensors();
+
+    // Теперь загружаем данные (температуры, статусы)
+    await fetchData();
+
+    // Загрузка графика (только если Chart.js доступен)
+    if (typeof Chart !== 'undefined') {
+        loadChart('24h');
+    } else {
+        console.warn('Chart.js not loaded - charts disabled');
+        // Показываем сообщение о недоступности графика
+        const chartCanvas = document.getElementById('temperatureChart');
+        const chartUnavailable = document.getElementById('chart-unavailable');
+        if (chartCanvas) chartCanvas.style.display = 'none';
+        if (chartUnavailable) chartUnavailable.style.display = 'block';
+    }
+
     // Установка интервала обновления
     updateInterval = setInterval(() => {
         fetchData();
-        loadChart(currentChartPeriod);
+        if (typeof Chart !== 'undefined') {
+            loadChart(currentChartPeriod);
+        }
     }, UPDATE_INTERVAL);
     
     // Обработка видимости страницы (остановка обновлений при скрытии вкладки)
@@ -899,10 +934,14 @@ function init() {
         } else {
             if (!updateInterval) {
                 fetchData();
-                loadChart(currentChartPeriod);
+                if (typeof Chart !== 'undefined') {
+                    loadChart(currentChartPeriod);
+                }
                 updateInterval = setInterval(() => {
                     fetchData();
-                    loadChart(currentChartPeriod);
+                    if (typeof Chart !== 'undefined') {
+                        loadChart(currentChartPeriod);
+                    }
                 }, UPDATE_INTERVAL);
             }
         }
