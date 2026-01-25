@@ -72,6 +72,10 @@ const unsigned long TELEGRAM_SEND_TIMEOUT = 5000; // Таймаут отправ
 int telegramConsecutiveFailures = 0;
 const int MAX_TELEGRAM_FAILURES = 3; // После 3 неудач подряд - пауза
 
+// FreeRTOS task handle для Telegram polling
+TaskHandle_t telegramTaskHandle = NULL;
+volatile bool telegramTaskRunning = false;
+
 static void updateTelegramFlags() {
   telegramConfigured = telegramBotToken.length() > 0;
   telegramCanSend = telegramConfigured && telegramChatId.length() > 0;
@@ -341,6 +345,42 @@ void processTelegramQueue() {
   }
 }
 
+// FreeRTOS задача для обработки Telegram сообщений
+// Работает в фоне, не блокирует основной loop()
+void telegramTask(void* parameter) {
+  Serial.println(F("Telegram task started"));
+  telegramTaskRunning = true;
+
+  while (true) {
+    // Ждём 5 секунд между проверками
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Проверяем, что WiFi подключен
+    if (WiFi.status() != WL_CONNECTED) {
+      telegramLastPollOk = false;
+      continue;
+    }
+
+    // Дополнительная проверка стабильности WiFi
+    if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+      telegramLastPollOk = false;
+      continue;
+    }
+
+    // Обрабатываем входящие сообщения
+    handleTelegramMessages();
+
+    // Сбрасываем WDT для этой задачи
+    vTaskDelay(pdMS_TO_TICKS(10)); // Короткая пауза для yield
+
+    // Обрабатываем очередь исходящих сообщений
+    processTelegramQueue();
+  }
+
+  telegramTaskRunning = false;
+  vTaskDelete(NULL);
+}
+
 void startTelegramBot() {
   // Настройка SSL для Telegram
   // Для ESP32 можно использовать setInsecure() для тестирования
@@ -350,6 +390,22 @@ void startTelegramBot() {
   secured_client.setTimeout(5); // 5 секунд таймаут для подключения
   ensureTelegramBot();
   initTelegramQueue(); // Инициализируем очередь
+
+  // Создаём FreeRTOS задачу для Telegram polling
+  // Запускаем на ядре 0 (Protocol CPU), чтобы не блокировать основной loop на ядре 1
+  if (telegramTaskHandle == NULL) {
+    xTaskCreatePinnedToCore(
+      telegramTask,         // Функция задачи
+      "TelegramTask",       // Имя задачи
+      8192,                 // Размер стека (8KB для SSL/HTTPS)
+      NULL,                 // Параметр
+      1,                    // Приоритет (низкий)
+      &telegramTaskHandle,  // Хэндл задачи
+      0                     // Ядро 0
+    );
+    Serial.println(F("Telegram task created on core 0"));
+  }
+
   if (telegramConfigured) {
     Serial.println(F("Telegram bot initialized"));
   } else {

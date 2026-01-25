@@ -14,6 +14,7 @@
 #include "tg_bot.h"
 #include "mqtt_client.h"
 #include "sensors.h"
+#include <OneWire.h>
 #include <DallasTemperature.h>
 
 extern float currentTemp;
@@ -33,6 +34,10 @@ AsyncWebServer server(80);
 
 // Preferences для надежного хранения критичных настроек
 Preferences preferences;
+
+// Флаг для отложенной записи в NVS (чтобы не блокировать WiFi)
+volatile bool pendingNvsSave = false;
+String pendingNvsData = "";
 #define PREF_NAMESPACE "esp32_thermo"
 #define PREF_WIFI_SSID "wifi_ssid"
 #define PREF_WIFI_PASS "wifi_pass"
@@ -204,9 +209,10 @@ void startWebServer() {
       }
     }
     
-    // Запрашиваем температуру для всех датчиков
-    sensors.requestTemperatures();
-    
+    // НЕ вызываем sensors.requestTemperatures() здесь - это блокирует на 750мс!
+    // Температура уже обновляется в main.cpp каждые 10 секунд
+    // getSensorTemperature() вернёт последнее кешированное значение
+
     // Добавляем все найденные датчики
     for (int i = 0; i < foundCount; i++) {
       uint8_t address[8];
@@ -475,8 +481,8 @@ void startWebServer() {
     }
     
     // Добавляем все найденные датчики
-    sensors.requestTemperatures(); // Запрашиваем температуру для всех датчиков
-    
+    // НЕ вызываем sensors.requestTemperatures() - температура обновляется в main loop
+
     for (int i = 0; i < foundCount; i++) {
       uint8_t address[8];
       if (getSensorAddress(i, address)) {
@@ -1255,123 +1261,12 @@ bool saveSettings(String json) {
   Serial.print(F(" bytes, Written: "));
   Serial.println(bytesWritten);
   
-  // Сохраняем критичные настройки (WiFi, Telegram, MQTT) в Preferences (NVS) как резерв
-  // Проверяем, что WiFi подключен перед сохранением (чтобы не блокировать работу)
-  bool wifiWasConnected = (WiFi.status() == WL_CONNECTED);
-  
-  // Даем больше времени WiFi перед началом записи в NVS
-  if (wifiWasConnected) {
-    delay(50); // Небольшая задержка для стабилизации WiFi
-    yield();
-  }
-  
-  preferences.begin(PREF_NAMESPACE, false); // read-write mode
-  
-  if (mergedDoc.containsKey("wifi")) {
-    String wifiSsid = mergedDoc["wifi"]["ssid"] | "";
-    String wifiPass = mergedDoc["wifi"]["password"] | "";
-    if (wifiSsid.length() > 0) {
-      bool success1 = preferences.putString(PREF_WIFI_SSID, wifiSsid);
-      delay(10); // Небольшая задержка между операциями NVS
-      yield();
-      bool success2 = preferences.putString(PREF_WIFI_PASS, wifiPass);
-      delay(10);
-      yield();
-      if (success1 && success2) {
-        Serial.println(F("WiFi settings saved to Preferences (NVS)"));
-      } else {
-        Serial.println(F("Failed to save WiFi settings to NVS"));
-      }
-    }
-  }
-  
-  delay(20); // Задержка между секциями
-  yield();
-  
-  if (mergedDoc.containsKey("telegram")) {
-    String tgToken = mergedDoc["telegram"]["bot_token"] | "";
-    String tgChatId = mergedDoc["telegram"]["chat_id"] | "";
-    if (tgToken.length() > 0 || tgChatId.length() > 0) {
-      bool success1 = preferences.putString(PREF_TG_TOKEN, tgToken);
-      delay(10);
-      yield();
-      bool success2 = preferences.putString(PREF_TG_CHATID, tgChatId);
-      delay(10);
-      yield();
-      if (success1 && success2) {
-        Serial.println(F("Telegram settings saved to Preferences (NVS)"));
-      } else {
-        Serial.println(F("Failed to save Telegram settings to NVS"));
-      }
-    }
-  }
-  
-  delay(20); // Задержка между секциями
-  yield();
-  
-  if (mergedDoc.containsKey("mqtt")) {
-    String mqttServer = mergedDoc["mqtt"]["server"] | "";
-    int mqttPort = mergedDoc["mqtt"]["port"] | 1883;
-    String mqttUser = mergedDoc["mqtt"]["user"] | "";
-    String mqttPass = mergedDoc["mqtt"]["password"] | "";
-    String mqttTopicSt = mergedDoc["mqtt"]["topic_status"] | "";
-    String mqttTopicCt = mergedDoc["mqtt"]["topic_control"] | "";
-    String mqttSec = mergedDoc["mqtt"]["security"] | "none";
-    
-    if (mqttServer.length() > 0 && mqttServer != "#" && mqttServer != "null") {
-      bool success1 = preferences.putString(PREF_MQTT_SERVER, mqttServer);
-      delay(10);
-      yield();
-      bool success2 = preferences.putInt(PREF_MQTT_PORT, mqttPort);
-      delay(10);
-      yield();
-      bool success3 = preferences.putString(PREF_MQTT_USER, mqttUser);
-      delay(10);
-      yield();
-      bool success4 = preferences.putString(PREF_MQTT_PASS, mqttPass);
-      delay(10);
-      yield();
-      if (mqttTopicSt.length() > 0) {
-        preferences.putString(PREF_MQTT_TOPIC_ST, mqttTopicSt);
-        yield();
-      }
-      if (mqttTopicCt.length() > 0) {
-        preferences.putString(PREF_MQTT_TOPIC_CT, mqttTopicCt);
-        yield();
-      }
-      bool success5 = preferences.putString(PREF_MQTT_SEC, mqttSec);
-      yield();
-      if (success1 && success2 && success3 && success4 && success5) {
-        Serial.println(F("MQTT settings saved to Preferences (NVS)"));
-      } else {
-        Serial.println(F("Failed to save MQTT settings to NVS"));
-      }
-    }
-  }
-  
-  preferences.end();
-  
-  // Даем время после завершения записи в NVS
-  delay(50);
-  yield();
-  
-  // Проверяем и восстанавливаем WiFi соединение, если оно было отключено
-  if (wifiWasConnected) {
-    delay(100); // Увеличиваем задержку для стабилизации WiFi
-    yield();
-    
-    // Проверяем, что WiFi все еще подключен
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println(F("WiFi disconnected during settings save, attempting reconnect..."));
-      // Не пытаемся переподключиться здесь - это может вызвать зависание
-      // WiFi автоматически переподключится через встроенный механизм
-    } else {
-      // WiFi все еще подключен - даем дополнительное время для стабилизации
-      delay(50);
-      yield();
-    }
-  }
-  
+  // Откладываем запись в NVS, чтобы не блокировать WiFi
+  // Запись будет выполнена в main loop через processPendingNvsSave()
+  pendingNvsData = output;
+  pendingNvsSave = true;
+  Serial.println(F("NVS save scheduled for background processing"));
+
   // Проверяем, что файл действительно записался
   delay(100); // Небольшая задержка для завершения записи
   yield();
@@ -1394,4 +1289,81 @@ bool saveSettings(String json) {
   }
   
   return true;
+}
+
+// Функция для обработки отложенной записи в NVS
+// Вызывается из main loop для записи настроек без блокировки WiFi
+void processPendingNvsSave() {
+  if (!pendingNvsSave || pendingNvsData.length() == 0) {
+    return;
+  }
+
+  Serial.println(F("Processing pending NVS save..."));
+
+  // Парсим JSON с настройками
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, pendingNvsData);
+
+  if (error) {
+    Serial.print(F("NVS save: JSON parse error: "));
+    Serial.println(error.c_str());
+    pendingNvsSave = false;
+    pendingNvsData = "";
+    return;
+  }
+
+  // Открываем NVS для записи
+  if (!preferences.begin(PREF_NAMESPACE, false)) {
+    Serial.println(F("NVS: Failed to open preferences"));
+    pendingNvsSave = false;
+    pendingNvsData = "";
+    return;
+  }
+
+  // Записываем WiFi настройки с yield между операциями
+  if (doc.containsKey("wifi")) {
+    String ssid = doc["wifi"]["ssid"] | "";
+    String pass = doc["wifi"]["password"] | "";
+    if (ssid.length() > 0) {
+      preferences.putString(PREF_WIFI_SSID, ssid);
+      yield();
+      preferences.putString(PREF_WIFI_PASS, pass);
+      yield();
+    }
+  }
+
+  // Записываем Telegram настройки
+  if (doc.containsKey("telegram")) {
+    String token = doc["telegram"]["token"] | "";
+    String chatId = doc["telegram"]["chatId"] | "";
+    preferences.putString(PREF_TG_TOKEN, token);
+    yield();
+    preferences.putString(PREF_TG_CHATID, chatId);
+    yield();
+  }
+
+  // Записываем MQTT настройки
+  if (doc.containsKey("mqtt")) {
+    String server = doc["mqtt"]["server"] | "";
+    int port = doc["mqtt"]["port"] | 1883;
+    String user = doc["mqtt"]["user"] | "";
+    String mqttPass = doc["mqtt"]["password"] | "";
+
+    preferences.putString(PREF_MQTT_SERVER, server);
+    yield();
+    preferences.putInt(PREF_MQTT_PORT, port);
+    yield();
+    preferences.putString(PREF_MQTT_USER, user);
+    yield();
+    preferences.putString(PREF_MQTT_PASS, mqttPass);
+    yield();
+  }
+
+  preferences.end();
+
+  // Очищаем данные
+  pendingNvsSave = false;
+  pendingNvsData = "";
+
+  Serial.println(F("NVS save completed"));
 }

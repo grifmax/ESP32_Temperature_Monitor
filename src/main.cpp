@@ -6,6 +6,7 @@
 #include <U8g2lib.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 #include "config.h"
 #include "web_server.h"
 #include "tg_bot.h"
@@ -354,7 +355,13 @@ void setup() {
   
   // Загружаем настройки термометров
   loadSensorConfigs();
-  
+
+  // Инициализация Watchdog Timer (30 сек таймаут, panic при срабатывании)
+  Serial.println(F("Initializing Watchdog Timer..."));
+  esp_task_wdt_init(30, true);
+  esp_task_wdt_add(NULL); // Добавляем текущую задачу (loop) к WDT
+  Serial.println(F("WDT initialized (30s timeout)"));
+
   Serial.println(F("========================================"));
   Serial.println(F("Setup complete!"));
   Serial.print(F("IP: "));
@@ -514,6 +521,9 @@ void loadSensorConfigs() {
 }
 
 void loop() {
+  // Сбрасываем Watchdog Timer в начале каждой итерации
+  esp_task_wdt_reset();
+
   // Обновление uptime
   deviceUptime = (millis() - deviceStartTime) / 1000;
   
@@ -567,7 +577,10 @@ void loop() {
   
   // Обновление бипера
   updateBuzzer();
-  
+
+  // Обработка отложенной записи в NVS (чтобы не блокировать WiFi при сохранении настроек)
+  processPendingNvsSave();
+
   // Обработка кнопки
   handleButton();
   
@@ -581,9 +594,10 @@ void loop() {
   if (isWiFiEnabled()) {
     updateTime();
   }
-  
-  updateMqtt();
-  
+
+  // MQTT теперь обрабатывается в отдельной FreeRTOS задаче (mqtt_client.cpp)
+  // Здесь только отправка метрик (не блокирующая операция)
+
   // Отправка метрик аптайма в MQTT каждые 60 секунд
   if (isMqttConnected() && millis() - lastMqttMetricsUpdate > 60000) {
     sendMqttMetrics(deviceUptime, currentTemp, deviceIP, wifiRSSI);
@@ -808,21 +822,9 @@ void loop() {
     }
   }
   
-  // Обработка Telegram сообщений (каждые 5 секунд, чтобы не перегружать API)
-  static unsigned long lastTelegramPoll = 0;
-  if (WiFi.status() == WL_CONNECTED && millis() - lastTelegramPoll > 5000) {
-    yield(); // Даем время другим задачам перед обработкой Telegram
-    handleTelegramMessages();
-    lastTelegramPoll = millis();
-    yield(); // Даем время после обработки
-  }
-  
-  // Обработка очереди Telegram сообщений (каждую итерацию, но только если есть сообщения)
-  // Это должно вызываться часто, чтобы сообщения отправлялись быстро
-  // Но не блокируем выполнение, если очередь пуста
-  processTelegramQueue();
-  
-  yield(); // Даем время другим задачам в конце цикла
-  
+  // Telegram теперь обрабатывается в отдельной FreeRTOS задаче (tg_bot.cpp)
+  // Это предотвращает блокировку основного loop при DNS запросах и HTTP операциях
+
+  yield();
   updateDisplay();
 }

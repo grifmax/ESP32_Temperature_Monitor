@@ -1,9 +1,20 @@
 #include "mqtt_client.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <esp_task_wdt.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+
+// Ограничение частоты переподключений
+static unsigned long lastMqttConnectAttempt = 0;
+static const unsigned long MQTT_RECONNECT_INTERVAL = 30000; // 30 сек между попытками
+
+// FreeRTOS task handle для MQTT
+TaskHandle_t mqttTaskHandle = NULL;
+volatile bool mqttTaskRunning = false;
 
 static String mqttServer = "";
 static int mqttPort = 1883;
@@ -14,9 +25,50 @@ static String mqttTopicControl = "";
 static String mqttSecurity = "none";
 static bool mqttConfigured = false;
 
+// FreeRTOS задача для обработки MQTT подключения
+// Работает в фоне, не блокирует основной loop()
+void mqttTask(void* parameter) {
+  Serial.println(F("MQTT task started"));
+  mqttTaskRunning = true;
+
+  while (true) {
+    // Ждём 1 секунду между итерациями
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // Проверяем, что WiFi подключен
+    if (WiFi.status() != WL_CONNECTED) {
+      continue;
+    }
+
+    // Обновляем MQTT (подключение/loop)
+    updateMqtt();
+
+    // Короткая пауза для yield
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  mqttTaskRunning = false;
+  vTaskDelete(NULL);
+}
+
 void initMqtt() {
   mqttClient.setServer("", 1883);
   mqttConfigured = false;
+
+  // Создаём FreeRTOS задачу для MQTT
+  // Запускаем на ядре 0 (Protocol CPU), чтобы не блокировать основной loop
+  if (mqttTaskHandle == NULL) {
+    xTaskCreatePinnedToCore(
+      mqttTask,           // Функция задачи
+      "MQTTTask",         // Имя задачи
+      4096,               // Размер стека (4KB достаточно для MQTT)
+      NULL,               // Параметр
+      1,                  // Приоритет (низкий)
+      &mqttTaskHandle,    // Хэндл задачи
+      0                   // Ядро 0
+    );
+    Serial.println(F("MQTT task created on core 0"));
+  }
 }
 
 void setMqttConfig(const String& server, int port, const String& user, const String& password, const String& topicStatus, const String& topicControl, const String& security) {
@@ -107,23 +159,34 @@ void updateMqtt() {
   
   if (!mqttClient.connected()) {
     if (WiFi.status() == WL_CONNECTED) {
+      // Ограничиваем частоту попыток переподключения
+      if (millis() - lastMqttConnectAttempt < MQTT_RECONNECT_INTERVAL) {
+        return; // Слишком рано для новой попытки
+      }
+
       // Дополнительная проверка стабильности WiFi перед подключением
       if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
-        // WiFi не имеет IP адреса, не пытаемся подключаться
-        return;
+        return; // WiFi не имеет IP адреса
       }
-      
-      // Устанавливаем таймаут для MQTT подключения
+
+      lastMqttConnectAttempt = millis();
+
+      // Устанавливаем короткий таймаут для MQTT подключения
       wifiClient.setTimeout(5); // 5 секунд таймаут
-      
+      mqttClient.setSocketTimeout(5); // Дополнительный таймаут PubSubClient
+
       String clientId = "ESP32_Thermo_" + String(random(0xffff), HEX);
       bool connected = false;
-      
+
       // Проверяем WiFi еще раз перед подключением
       if (WiFi.status() != WL_CONNECTED) {
-        return; // WiFi отключился
+        return;
       }
-      
+
+      // Сброс WDT перед потенциально долгой операцией
+      esp_task_wdt_reset();
+      yield();
+
       unsigned long connectStart = millis();
       if (mqttUser.length() > 0) {
         connected = mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPassword.c_str());
@@ -131,6 +194,10 @@ void updateMqtt() {
         connected = mqttClient.connect(clientId.c_str());
       }
       unsigned long connectDuration = millis() - connectStart;
+
+      // Сброс WDT после операции
+      esp_task_wdt_reset();
+      yield();
       
       // Проверяем, не отключился ли WiFi после попытки подключения
       if (WiFi.status() != WL_CONNECTED) {
