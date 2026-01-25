@@ -8,5 +8,7 @@ extern AsyncWebServer server;
 void startWebServer();
 String getSettings();
 bool saveSettings(String json);
+void processPendingNvsSave();
+void processPendingSettingsSave(); // Обработка отложенного сохранения настроек
 
 #endif

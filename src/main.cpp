@@ -6,6 +6,7 @@
 #include <U8g2lib.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 #include "config.h"
 #include "web_server.h"
 #include "tg_bot.h"
@@ -77,7 +78,7 @@ struct SensorConfig {
   float stabTolerance;
   float stabAlertThreshold;
   unsigned long stabDuration;
-  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
+  float monitoringThreshold;  // Уставка изменения температуры для отправки в режиме мониторинга (°C)
   bool valid;
 };
 
@@ -181,7 +182,7 @@ void setup() {
   String savedMqttSecurity;
   {
     String settingsJson = getSettings();
-    StaticJsonDocument<768> doc;
+    StaticJsonDocument<4096> doc; // Увеличен для поддержки множества датчиков
     DeserializationError error = deserializeJson(doc, settingsJson);
     if (!error && doc.containsKey("wifi")) {
       const char* ssid = doc["wifi"]["ssid"] | "";
@@ -354,7 +355,13 @@ void setup() {
   
   // Загружаем настройки термометров
   loadSensorConfigs();
-  
+
+  // Инициализация Watchdog Timer (30 сек таймаут, panic при срабатывании)
+  Serial.println(F("Initializing Watchdog Timer..."));
+  esp_task_wdt_init(30, true);
+  esp_task_wdt_add(NULL); // Добавляем текущую задачу (loop) к WDT
+  Serial.println(F("WDT initialized (30s timeout)"));
+
   Serial.println(F("========================================"));
   Serial.println(F("Setup complete!"));
   Serial.print(F("IP: "));
@@ -446,12 +453,24 @@ void handleButton() {
 void loadSensorConfigs() {
   sensorConfigCount = 0;
   
+  // Проверяем WiFi перед чтением настроек
+  if (WiFi.status() != WL_CONNECTED && !isAPMode()) {
+    // Если WiFi не подключен и не в режиме AP, пропускаем загрузку настроек
+    // чтобы не блокировать систему
+    return;
+  }
+  
   String settingsJson = getSettings();
   StaticJsonDocument<4096> doc;
   DeserializationError error = deserializeJson(doc, settingsJson);
   
   if (error || !doc.containsKey("sensors")) {
-    Serial.println(F("No sensor settings found or parse error"));
+    // Логируем только если это не первая загрузка (чтобы не засорять лог)
+    static bool firstLoad = true;
+    if (!firstLoad) {
+      Serial.println(F("No sensor settings found or parse error"));
+    }
+    firstLoad = false;
     return;
   }
   
@@ -476,7 +495,17 @@ void loadSensorConfigs() {
     config.mode = modeStr;
     config.sendToNetworks = sensor["sendToNetworks"] | true;
     config.buzzerEnabled = sensor["buzzerEnabled"] | false;
-    config.monitoringInterval = sensor["monitoringInterval"] | 5; // По умолчанию 5 секунд
+    // Загружаем уставку изменения температуры (обратная совместимость с monitoringInterval)
+    if (sensor.containsKey("monitoringThreshold")) {
+      config.monitoringThreshold = sensor["monitoringThreshold"] | 1.0;
+    } else if (sensor.containsKey("monitoringInterval")) {
+      // Обратная совместимость: конвертируем старый интервал в уставку
+      // 5 секунд интервала = примерно 0.5 градуса уставки (примерная оценка)
+      unsigned long oldInterval = sensor["monitoringInterval"] | 5;
+      config.monitoringThreshold = (oldInterval <= 5) ? 0.5 : 1.0; // По умолчанию 1.0 градус
+    } else {
+      config.monitoringThreshold = 1.0; // По умолчанию 1.0 градус
+    }
     
     // Настройки оповещения
     if (sensor.containsKey("alertSettings")) {
@@ -514,6 +543,9 @@ void loadSensorConfigs() {
 }
 
 void loop() {
+  // Сбрасываем Watchdog Timer в начале каждой итерации
+  esp_task_wdt_reset();
+
   // Обновление uptime
   deviceUptime = (millis() - deviceStartTime) / 1000;
   
@@ -567,7 +599,13 @@ void loop() {
   
   // Обновление бипера
   updateBuzzer();
+
+  // Обработка отложенного сохранения настроек в SPIFFS (полностью асинхронное сохранение)
+  processPendingSettingsSave();
   
+  // Обработка отложенной записи в NVS (чтобы не блокировать WiFi при сохранении настроек)
+  processPendingNvsSave();
+
   // Обработка кнопки
   handleButton();
   
@@ -581,9 +619,10 @@ void loop() {
   if (isWiFiEnabled()) {
     updateTime();
   }
-  
-  updateMqtt();
-  
+
+  // MQTT теперь обрабатывается в отдельной FreeRTOS задаче (mqtt_client.cpp)
+  // Здесь только отправка метрик (не блокирующая операция)
+
   // Отправка метрик аптайма в MQTT каждые 60 секунд
   if (isMqttConnected() && millis() - lastMqttMetricsUpdate > 60000) {
     sendMqttMetrics(deviceUptime, currentTemp, deviceIP, wifiRSSI);
@@ -593,12 +632,31 @@ void loop() {
   // Перезагружаем настройки термометров каждые 30 секунд или принудительно после сохранения
   // Но не чаще, чем раз в 5 секунд, чтобы не перегружать систему
   static unsigned long lastReloadCheck = 0;
+  static unsigned long forceReloadDelay = 0; // Задержка перед принудительной перезагрузкой
+  
   if (millis() - lastReloadCheck > 5000) {
     lastReloadCheck = millis();
-    if (forceReloadSettings || (millis() - lastSettingsReload > SETTINGS_RELOAD_INTERVAL)) {
+    
+    // Если установлен флаг принудительной перезагрузки, устанавливаем задержку
+    if (forceReloadSettings && forceReloadDelay == 0) {
+      forceReloadDelay = millis() + 2000; // Задержка 2 секунды после сохранения
+    }
+    
+    // Перезагружаем настройки если:
+    // 1. Прошло 30 секунд с последней перезагрузки, ИЛИ
+    // 2. Установлен флаг принудительной перезагрузки И прошла задержка
+    bool shouldReload = false;
+    if (millis() - lastSettingsReload > SETTINGS_RELOAD_INTERVAL) {
+      shouldReload = true;
+    } else if (forceReloadSettings && forceReloadDelay > 0 && millis() >= forceReloadDelay) {
+      shouldReload = true;
+      forceReloadSettings = false;
+      forceReloadDelay = 0;
+    }
+    
+    if (shouldReload) {
       loadSensorConfigs();
       lastSettingsReload = millis();
-      forceReloadSettings = false;
     }
   }
   
@@ -649,21 +707,22 @@ void loop() {
       
       // Обрабатываем режим работы термометра
       if (config->mode == "monitoring") {
-        if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
-          // Обновляем lastSentTemp для текущего термометра
+        // Проверяем, изменилась ли температура на уставку или больше
+        float tempDiff = (correctedTemp > sensorStates[i].lastSentTemp) ? 
+                         (correctedTemp - sensorStates[i].lastSentTemp) : 
+                         (sensorStates[i].lastSentTemp - correctedTemp);
+        float threshold = (config->monitoringThreshold > 0.0) ? config->monitoringThreshold : 1.0;
+        
+        if (tempDiff >= threshold) {
+          // Температура изменилась на уставку или больше - отправляем данные
           sensorStates[i].lastSentTemp = correctedTemp;
           
-          // Проверяем, нужно ли отправить метрики (только если WiFi подключен)
-          // Используем индивидуальный интервал для каждого термометра
-          static unsigned long lastMetricsSend[MAX_SENSORS] = {0};
-          unsigned long intervalMs = (config->monitoringInterval > 0) ? (config->monitoringInterval * 1000) : 5000;
-          if (WiFi.status() == WL_CONNECTED && (millis() - lastMetricsSend[i] > intervalMs)) {
+          // Отправляем метрики только если WiFi подключен
+          if (WiFi.status() == WL_CONNECTED) {
             // Отправляем метрики для всех термометров одним сообщением
             sendMetricsToTelegram("", -127.0); // Пустое имя означает "отправить все"
-            lastMetricsSend[i] = millis();
             
             // Обновляем lastSentTemp для всех термометров, чтобы не отправлять повторно
-            // Упрощенная версия - обновляем только те, которые мы обрабатываем
             for (int j = 0; j < sensorCount && j < MAX_SENSORS; j++) {
               if (j == i) continue; // Уже обновили
               uint8_t addr[8];
@@ -808,21 +867,9 @@ void loop() {
     }
   }
   
-  // Обработка Telegram сообщений (каждые 5 секунд, чтобы не перегружать API)
-  static unsigned long lastTelegramPoll = 0;
-  if (WiFi.status() == WL_CONNECTED && millis() - lastTelegramPoll > 5000) {
-    yield(); // Даем время другим задачам перед обработкой Telegram
-    handleTelegramMessages();
-    lastTelegramPoll = millis();
-    yield(); // Даем время после обработки
-  }
-  
-  // Обработка очереди Telegram сообщений (каждую итерацию, но только если есть сообщения)
-  // Это должно вызываться часто, чтобы сообщения отправлялись быстро
-  // Но не блокируем выполнение, если очередь пуста
-  processTelegramQueue();
-  
-  yield(); // Даем время другим задачам в конце цикла
-  
+  // Telegram теперь обрабатывается в отдельной FreeRTOS задаче (tg_bot.cpp)
+  // Это предотвращает блокировку основного loop при DNS запросах и HTTP операциях
+
+  yield();
   updateDisplay();
 }
