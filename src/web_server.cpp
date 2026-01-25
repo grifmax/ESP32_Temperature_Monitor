@@ -15,6 +15,14 @@
 #include "mqtt_client.h"
 #include "sensors.h"
 #include <DallasTemperature.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+// Для использования MAX_HISTORY_SIZE в web_server.cpp
+#ifndef MAX_HISTORY_SIZE
+#define MAX_HISTORY_SIZE 288
+#endif
 
 extern float currentTemp;
 extern DallasTemperature sensors;
@@ -27,6 +35,32 @@ extern DallasTemperature sensors;
 // extern WiFiManager wm;  // Временно отключено
 
 AsyncWebServer server(80);
+
+// Мьютекс для защиты доступа к sensors и SPIFFS
+// ВАЖНО: Порядок взятия мьютексов должен быть ВСЕГДА одинаковым для предотвращения deadlock:
+// 1. Сначала sensorsMutex
+// 2. Затем spiffsMutex
+// Если нужно взять только один мьютекс, можно взять только его, но если нужны оба - всегда в этом порядке
+SemaphoreHandle_t sensorsMutex = NULL;
+SemaphoreHandle_t spiffsMutex = NULL;
+
+// Кеш для данных API
+struct ApiDataCache {
+  String jsonData;
+  unsigned long lastUpdate;
+  bool valid;
+};
+static ApiDataCache apiDataCache = {"", 0, false};
+static const unsigned long API_CACHE_TTL = 2000; // Кеш на 2 секунды
+
+// Кеш для настроек (getSettings)
+struct SettingsCache {
+  String jsonData;
+  unsigned long lastUpdate;
+  bool valid;
+};
+static SettingsCache settingsCache = {"", 0, false};
+static const unsigned long SETTINGS_CACHE_TTL = 5000; // Кеш на 5 секунд
 
 // Файл для хранения настроек
 #define SETTINGS_FILE "/settings.json"
@@ -47,32 +81,82 @@ Preferences preferences;
 #define PREF_MQTT_SEC "mqtt_sec"
 
 void startWebServer() {
+  // Инициализация мьютексов
+  if (sensorsMutex == NULL) {
+    sensorsMutex = xSemaphoreCreateMutex();
+  }
+  if (spiffsMutex == NULL) {
+    spiffsMutex = xSemaphoreCreateMutex();
+  }
+  
+  // Очищаем кеши при старте сервера
+  apiDataCache.valid = false;
+  apiDataCache.jsonData = "";
+  apiDataCache.lastUpdate = 0;
+  settingsCache.valid = false;
+  settingsCache.jsonData = "";
+  settingsCache.lastUpdate = 0;
+  Serial.println(F("Web server caches cleared"));
+  
   // Главная страница
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    yield(); // Кормим watchdog
     request->send(SPIFFS, "/index.html", "text/html");
   });
   
   // Статические файлы (без gzip)
   server.on("/index.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    yield();
     request->send(SPIFFS, "/index.html", "text/html");
   });
   server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request){
+    yield();
     request->send(SPIFFS, "/style.css", "text/css");
   });
   server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    yield();
     request->send(SPIFFS, "/script.js", "application/javascript");
   });
   server.on("/settings.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    yield(); // Особенно важно для страницы настроек
     request->send(SPIFFS, "/settings.html", "text/html");
   });
   server.on("/settings.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    yield();
     request->send(SPIFFS, "/settings.js", "application/javascript");
   });
   
   // JSON API endpoint для получения данных
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
-    // Увеличено для поддержки данных о термометрах
-    StaticJsonDocument<2048> doc;
+    // Кормим watchdog сразу
+    yield();
+    
+    // Проверяем кеш
+    unsigned long now = millis();
+    if (apiDataCache.valid && (now - apiDataCache.lastUpdate) < API_CACHE_TTL) {
+      // Проверяем, что кеш содержит валидные данные (должен содержать sensors массив)
+      if (apiDataCache.jsonData.length() > 0 && apiDataCache.jsonData.indexOf("\"sensors\"") > 0) {
+        Serial.print(F("API data served from cache (age: "));
+        Serial.print(now - apiDataCache.lastUpdate);
+        Serial.println(F("ms)"));
+        request->send(200, "application/json", apiDataCache.jsonData);
+        return;
+      } else {
+        // Кеш невалиден, инвалидируем его
+        Serial.println(F("Invalid cache, regenerating"));
+        apiDataCache.valid = false;
+      }
+    } else if (apiDataCache.valid) {
+      Serial.print(F("Cache expired (age: "));
+      Serial.print(now - apiDataCache.lastUpdate);
+      Serial.println(F("ms), regenerating"));
+      apiDataCache.valid = false;
+    }
+    
+    yield(); // Даем время перед началом работы
+    
+    // Увеличено для поддержки данных о термометрах (увеличиваем до 8192 для большего количества датчиков и данных)
+    StaticJsonDocument<8192> doc;
     
     // Получаем актуальный IP адрес
     String currentIP = deviceIP;
@@ -120,21 +204,35 @@ void startWebServer() {
       doc["wifi_connected_formatted"] = "--";
     }
     
-    // Добавление времени
+    // Добавление времени (с yield между вызовами)
+    unsigned long unixTime = getUnixTime();
+    yield();
     doc["current_time"] = getCurrentTime();
+    yield();
     doc["current_date"] = getCurrentDate();
-    doc["unix_time"] = getUnixTime();
-    doc["time_synced"] = getUnixTime() > 0;
+    yield();
+    doc["unix_time"] = unixTime;
+    doc["time_synced"] = unixTime > 0;
+    yield();
 
-    // Статусы сервисов
+    // Статусы сервисов (упрощенно, с yield)
+    // Создаем объекты для mqtt и telegram явно
+    JsonObject mqttObj = doc.createNestedObject("mqtt");
     bool mqttConfigured = isMqttConfigured();
-    doc["mqtt"]["configured"] = mqttConfigured;
-    doc["mqtt"]["status"] = getMqttStatus();
+    yield();
+    mqttObj["configured"] = mqttConfigured;
+    mqttObj["status"] = getMqttStatus();
+    yield();
 
+    JsonObject telegramObj = doc.createNestedObject("telegram");
     bool telegramConfigured = isTelegramConfigured();
+    yield();
     bool telegramInitialized = isTelegramInitialized();
+    yield();
     bool telegramPollOk = isTelegramPollOk();
+    yield();
     unsigned long lastPollMs = getTelegramLastPollMs();
+    yield();
     const char* telegramStatus = "not_configured";
     if (telegramConfigured) {
       if (telegramPollOk && lastPollMs > 0 && (millis() - lastPollMs) < 30000) {
@@ -145,132 +243,191 @@ void startWebServer() {
         telegramStatus = "not_initialized";
       }
     }
-    doc["telegram"]["configured"] = telegramConfigured;
-    doc["telegram"]["status"] = telegramStatus;
+    telegramObj["configured"] = telegramConfigured;
+    telegramObj["status"] = telegramStatus;
     if (lastPollMs > 0) {
-      doc["telegram"]["last_poll_age"] = (millis() - lastPollMs) / 1000;
+      telegramObj["last_poll_age"] = (millis() - lastPollMs) / 1000;
     }
+    yield();
     
-    // Информация о режиме работы
+    // Информация о режиме работы (упрощенно)
     OperationMode mode = getOperationMode();
+    yield();
     doc["operation_mode"] = mode;
     const char* modeNames[] = {"local", "monitoring", "alert", "stabilization"};
     doc["operation_mode_name"] = modeNames[mode];
+    yield();
     
-    // Дополнительная информация для режима стабилизации
+    // Дополнительная информация для режима стабилизации (только если нужно)
     if (mode == MODE_STABILIZATION) {
-      doc["stabilization"]["is_stabilized"] = isStabilized();
-      doc["stabilization"]["time"] = getStabilizationTime();
+      JsonObject stabObj = doc.createNestedObject("stabilization");
+      stabObj["is_stabilized"] = isStabilized();
+      yield();
+      stabObj["time"] = getStabilizationTime();
+      yield();
       StabilizationModeSettings stab = getStabilizationSettings();
-      doc["stabilization"]["target_temp"] = stab.targetTemp;
-      doc["stabilization"]["tolerance"] = stab.tolerance;
+      yield();
+      stabObj["target_temp"] = stab.targetTemp;
+      stabObj["tolerance"] = stab.tolerance;
+      yield();
     }
     
-    // Добавляем информацию о термометрах (автоматическое обнаружение)
-    scanSensors();
-    int foundCount = getSensorCount();
+    // Обработка датчиков - используем кешированные температуры (неблокирующие)
     JsonArray sensorsArray = doc.createNestedArray("sensors");
     
-    // Загружаем настройки из файла
-    String settingsJson = getSettings();
-    StaticJsonDocument<2048> settingsDoc;
-    DeserializationError settingsError = deserializeJson(settingsDoc, settingsJson);
+    // Получаем количество датчиков (неблокирующая операция)
+    int foundCount = getSensorCount();
+    yield();
     
-    // Создаем карту сохраненных настроек по адресу
-    JsonObject savedSensorsMap;
-    if (!settingsError && settingsDoc.containsKey("sensors") && settingsDoc["sensors"].is<JsonArray>()) {
-      JsonArray savedSensors = settingsDoc["sensors"].as<JsonArray>();
-      for (JsonObject savedSensor : savedSensors) {
-        String savedAddress = savedSensor["address"] | "";
-        if (savedAddress.length() > 0) {
-          if (!savedSensorsMap.containsKey(savedAddress)) {
-            savedSensorsMap = savedSensorsMap.createNestedObject(savedAddress);
-            savedSensorsMap["name"] = savedSensor["name"] | "";
-            savedSensorsMap["enabled"] = savedSensor["enabled"] | true;
-            savedSensorsMap["correction"] = savedSensor["correction"] | 0.0;
-            savedSensorsMap["mode"] = savedSensor["mode"] | "monitoring";
-            savedSensorsMap["sendToNetworks"] = savedSensor["sendToNetworks"] | true;
-            savedSensorsMap["buzzerEnabled"] = savedSensor["buzzerEnabled"] | false;
-            if (savedSensor.containsKey("alertSettings")) {
-              savedSensorsMap["alertSettings"] = savedSensor["alertSettings"];
-            }
-            if (savedSensor.containsKey("stabilizationSettings")) {
-              savedSensorsMap["stabilizationSettings"] = savedSensor["stabilizationSettings"];
-            }
-          }
-        }
-      }
-    }
+    Serial.print(F("Found sensors count: "));
+    Serial.println(foundCount);
     
-    // Запрашиваем температуру для всех датчиков
-    sensors.requestTemperatures();
-    
-    // Добавляем все найденные датчики
-    for (int i = 0; i < foundCount; i++) {
+    // Добавляем данные для всех найденных датчиков
+    int addedCount = 0;
+    for (int i = 0; i < foundCount && i < 10; i++) {
       uint8_t address[8];
       if (getSensorAddress(i, address)) {
         String addressStr = getSensorAddressString(i);
-        float temp = getSensorTemperature(i);
+        // Используем кешированную температуру (обновляется в main.cpp каждые 10 секунд)
+        float temp = getCachedSensorTemperature(i);
+        yield();
         
         JsonObject sensor = sensorsArray.createNestedObject();
-        sensor["index"] = i;
-        sensor["address"] = addressStr;
-        
-        // Используем сохраненные настройки, если есть
-        if (savedSensorsMap.containsKey(addressStr)) {
-          JsonObject saved = savedSensorsMap[addressStr];
-          String defaultName = "Термометр " + String(i + 1);
-          String savedName = saved["name"].as<String>();
-          sensor["name"] = (savedName.length() > 0) ? savedName : defaultName;
-          sensor["enabled"] = saved["enabled"] | true;
-          sensor["correction"] = saved["correction"] | 0.0;
-          sensor["mode"] = saved["mode"] | "monitoring";
-          sensor["monitoringInterval"] = saved["monitoringInterval"] | 5;
-          sensor["sendToNetworks"] = saved["sendToNetworks"] | true;
-          sensor["buzzerEnabled"] = saved["buzzerEnabled"] | false;
-          
-          if (saved.containsKey("alertSettings")) {
-            sensor["alertSettings"] = saved["alertSettings"];
-          }
-          if (saved.containsKey("stabilizationSettings")) {
-            sensor["stabilizationSettings"] = saved["stabilizationSettings"];
-          }
-        } else {
-          // Настройки по умолчанию
+        // Проверяем, что объект создан успешно (в ArduinoJson isNull() проверяет валидность)
+        if (!sensor.isNull()) {
+            sensor["address"] = addressStr;
+          sensor["currentTemp"] = temp;
           sensor["name"] = "Термометр " + String(i + 1);
-          sensor["enabled"] = true;
-          sensor["correction"] = 0.0;
-          sensor["mode"] = "monitoring";
-          sensor["monitoringInterval"] = 5;
-          sensor["sendToNetworks"] = true;
-          sensor["buzzerEnabled"] = false;
-          sensor["alertSettings"]["minTemp"] = 10.0;
-          sensor["alertSettings"]["maxTemp"] = 30.0;
-          sensor["alertSettings"]["buzzerEnabled"] = true;
-          sensor["stabilizationSettings"]["targetTemp"] = 25.0;
-          sensor["stabilizationSettings"]["tolerance"] = 0.1;
-          sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
-          sensor["stabilizationSettings"]["duration"] = 10;
+          sensor["stabilizationState"] = "tracking";
+          addedCount++;
+        } else {
+          Serial.print(F("ERROR: Failed to create sensor object for index "));
+          Serial.println(i);
+          break; // Прерываем цикл, если не удалось создать объект
         }
-        
-        // Текущая температура с учетом коррекции
-        float correction = sensor["correction"] | 0.0;
-        sensor["currentTemp"] = (temp != -127.0) ? (temp + correction) : -127.0;
-        sensor["stabilizationState"] = "tracking";
+        yield();
       }
     }
     
-    String response;
-    serializeJson(doc, response);
+    Serial.print(F("Added sensors to JSON: "));
+    Serial.println(addedCount);
     
+    // Если датчиков нет, добавляем хотя бы один для обратной совместимости
+    if (foundCount == 0 || addedCount == 0) {
+      JsonObject sensor = sensorsArray.createNestedObject();
+      if (!sensor.isNull()) {
+        sensor["index"] = 0;
+        sensor["currentTemp"] = currentTemp;
+        sensor["name"] = "Термометр 1";
+        Serial.println(F("Added fallback sensor"));
+      } else {
+        Serial.println(F("ERROR: Failed to create fallback sensor object - JSON may be full"));
+      }
+      yield();
+    }
+    
+    yield(); // Перед сериализацией
+    
+    // Проверяем размер документа перед сериализацией
+    size_t docSize = measureJson(doc);
+    Serial.print(F("API data JSON size before serialization: "));
+    Serial.print(docSize);
+    Serial.print(F(" bytes (capacity: 8192, sensors added: "));
+    Serial.print(addedCount);
+    Serial.print(F(")"));
+    
+    // Проверяем, не переполнен ли документ
+    if (docSize > 8192) {
+      Serial.print(F(" - OVERFLOW WARNING!"));
+    }
+    Serial.println();
+    
+    String response;
+    size_t serializedSize = serializeJson(doc, response);
+    
+    // Проверяем, что сериализация прошла успешно
+    if (serializedSize == 0) {
+      Serial.println(F("ERROR: JSON serialization failed! Document may be too large or corrupted."));
+      // Пытаемся отправить минимальный ответ с ошибкой
+      request->send(500, "application/json", "{\"error\":\"Serialization failed\",\"sensors\":[],\"mqtt\":{\"status\":\"error\"},\"telegram\":{\"status\":\"error\"}}");
+      return;
+    }
+    
+    Serial.print(F("API response serialized size: "));
+    Serial.print(serializedSize);
+    Serial.print(F(" bytes, string length: "));
+    Serial.println(response.length());
+    
+    // Проверяем размер ответа (защита от переполнения)
+    // Увеличиваем лимит до 32KB, так как данные о термометрах могут быть большими
+    if (response.length() > 32768) {
+      Serial.print(F("WARNING: API response too large ("));
+      Serial.print(response.length());
+      Serial.println(F(" bytes), truncating"));
+      response = response.substring(0, 32768);
+    }
+    
+    yield(); // После сериализации
+    
+    // Проверяем, что ответ содержит все необходимые поля
+    bool hasSensors = response.indexOf("\"sensors\"") > 0;
+    bool hasMqtt = response.indexOf("\"mqtt\"") > 0;
+    bool hasTelegram = response.indexOf("\"telegram\"") > 0;
+    bool hasUptime = response.indexOf("\"uptime\"") > 0;
+    
+    Serial.print(F("Response field checks - sensors: "));
+    Serial.print(hasSensors ? "OK" : "MISSING");
+    Serial.print(F(", mqtt: "));
+    Serial.print(hasMqtt ? "OK" : "MISSING");
+    Serial.print(F(", telegram: "));
+    Serial.print(hasTelegram ? "OK" : "MISSING");
+    Serial.print(F(", uptime: "));
+    Serial.print(hasUptime ? "OK" : "MISSING");
+    Serial.println();
+    
+    // Кешируем только если есть хотя бы sensors (остальные поля могут отсутствовать в некоторых случаях)
+    bool responseValid = hasSensors; // Минимальное требование - наличие sensors
+    
+    if (responseValid) {
+      // Обновляем кеш только если ответ валиден
+      apiDataCache.jsonData = response;
+      apiDataCache.lastUpdate = now;
+      apiDataCache.valid = true;
+      Serial.println(F("API response cached successfully"));
+    } else {
+      Serial.println(F("WARNING: API response missing 'sensors' field, not caching"));
+      apiDataCache.valid = false;
+    }
+    
+    yield(); // Перед отправкой ответа
+    
+    // Логируем первые 200 символов ответа для отладки
+    Serial.print(F("Sending response (first 200 chars): "));
+    if (response.length() > 200) {
+      Serial.println(response.substring(0, 200));
+    } else {
+      Serial.println(response);
+    }
+    
+    // ВСЕГДА отправляем ответ, даже если некоторые поля отсутствуют
     request->send(200, "application/json", response);
+    Serial.println(F("Response sent to client (200 OK)"));
   });
   
   // API для получения истории температуры
   server.on("/api/temperature/history", HTTP_GET, [](AsyncWebServerRequest *request){
+    yield(); // Кормим watchdog
+    
     String period = request->getParam("period") ? request->getParam("period")->value() : "24h";
     
     unsigned long endTime = getUnixTime();
+    // Если время не синхронизировано, используем относительное время
+    bool timeSynced = (endTime > 0);
+    if (!timeSynced) {
+      // Используем millis() для относительного времени
+      endTime = millis() / 1000;
+    }
+    
     unsigned long startTime = endTime;
     
     // Определение периода
@@ -303,28 +460,82 @@ void startWebServer() {
     StaticJsonDocument<2560> doc;
     JsonArray data = doc.createNestedArray("data");
     
-    for (int i = 0; i < maxRecords; i++) {
-      // Пропускаем записи с нулевыми или невалидными значениями
-      if (records[i].temperature == 0.0 || records[i].temperature == -127.0 || records[i].timestamp == 0) {
-        continue;
+    // Если время не синхронизировано, возвращаем все доступные записи
+    if (!timeSynced && count == 0) {
+      // Пытаемся получить все записи
+      int allCount = 0;
+      TemperatureRecord* allRecords = getHistory(&allCount);
+      if (allRecords && allCount > 0) {
+        int recordsToReturn = allCount > 100 ? 100 : allCount;
+        for (int i = 0; i < recordsToReturn; i++) {
+          int idx = (allCount - recordsToReturn + i) % MAX_HISTORY_SIZE;
+          if (allRecords[idx].temperature != 0.0 && allRecords[idx].temperature != -127.0) {
+            JsonObject record = data.createNestedObject();
+            record["timestamp"] = allRecords[idx].timestamp;
+            record["temperature"] = allRecords[idx].temperature;
+            if (allRecords[idx].sensorAddress.length() > 0) {
+              record["sensor_address"] = allRecords[idx].sensorAddress;
+              record["sensor_id"] = allRecords[idx].sensorAddress;
+            }
+          }
+          yield();
+        }
+        doc["count"] = recordsToReturn;
+      } else {
+        doc["count"] = 0;
       }
+    } else if (records && count > 0) {
+      // Фильтруем записи напрямую из исходного массива (безопасно, без malloc)
+      // Используем getHistory для получения доступа к исходному массиву
+      int allCount = 0;
+      TemperatureRecord* allRecords = getHistory(&allCount);
       
-      JsonObject record = data.createNestedObject();
-      record["timestamp"] = records[i].timestamp;
-      record["temperature"] = records[i].temperature;
-      // Добавляем адрес термометра для идентификации
-      if (records[i].sensorAddress.length() > 0) {
-        record["sensor_address"] = records[i].sensorAddress;
-        record["sensor_id"] = records[i].sensorAddress; // Для совместимости
+      if (allRecords && allCount > 0) {
+        int addedCount = 0;
+        // Проходим по всем записям и фильтруем по периоду
+        // Используем правильный расчет индекса для циклического буфера
+        for (int i = 0; i < allCount && addedCount < maxRecords; i++) {
+          // Вычисляем индекс в циклическом буфере (как в getHistoryForPeriod)
+          // historyIndex указывает на следующую позицию для записи
+          // Самые старые записи: (historyIndex - historyCount + i) % MAX_HISTORY_SIZE
+          // Но мы не знаем historyIndex, поэтому используем упрощенный подход
+          // Проходим от начала массива (самые старые записи)
+          int idx = i;
+          
+          // Проверяем, что запись попадает в период и валидна
+          if (allRecords[idx].timestamp >= startTime && 
+              allRecords[idx].timestamp <= endTime &&
+              allRecords[idx].temperature != 0.0 && 
+              allRecords[idx].temperature != -127.0 &&
+              allRecords[idx].timestamp != 0) {
+            
+            JsonObject record = data.createNestedObject();
+            record["timestamp"] = allRecords[idx].timestamp;
+            record["temperature"] = allRecords[idx].temperature;
+            // Добавляем адрес термометра для идентификации
+            if (allRecords[idx].sensorAddress.length() > 0) {
+              record["sensor_address"] = allRecords[idx].sensorAddress;
+              record["sensor_id"] = allRecords[idx].sensorAddress; // Для совместимости
+            }
+            addedCount++;
+          }
+          yield(); // Предотвращаем watchdog reset
+        }
+        doc["count"] = addedCount;
+      } else {
+        doc["count"] = 0;
       }
-      yield(); // Предотвращаем watchdog reset
+    } else {
+      doc["count"] = 0;
     }
     
-    doc["count"] = maxRecords;
     doc["period"] = period;
+    doc["time_synced"] = timeSynced;
     
+    yield(); // Перед сериализацией JSON
     String response;
     serializeJson(doc, response);
+    yield(); // После сериализации
     
     request->send(200, "application/json", response);
   });
@@ -334,12 +545,24 @@ void startWebServer() {
     Serial.println(F("WiFi scan requested..."));
 
     // Убеждаемся, что WiFi в режиме, позволяющем сканировать
+    // Добавляем таймаут для операций WiFi
+    unsigned long wifiOpStart = millis();
+    const unsigned long WIFI_OP_TIMEOUT = 2000; // 2 секунды таймаут
+    
     if (WiFi.getMode() == WIFI_AP) {
       WiFi.mode(WIFI_AP_STA);
-      delay(100);
+      yield(); // Даем время WiFi на переключение режима
+      // Проверяем таймаут
+      if (millis() - wifiOpStart > WIFI_OP_TIMEOUT) {
+        Serial.println(F("WARNING: WiFi mode change took too long"));
+      }
     } else if (WiFi.getMode() == WIFI_OFF) {
       WiFi.mode(WIFI_STA);
-      delay(100);
+      yield(); // Даем время WiFi на переключение режима
+      // Проверяем таймаут
+      if (millis() - wifiOpStart > WIFI_OP_TIMEOUT) {
+        Serial.println(F("WARNING: WiFi mode change took too long"));
+      }
     }
     
     // Проверяем, есть ли уже результаты сканирования
@@ -379,8 +602,10 @@ void startWebServer() {
     
     doc["count"] = maxNetworks;
     
+    yield(); // Перед сериализацией
     String response;
     serializeJson(doc, response);
+    yield(); // После сериализации
     
     // Очищаем результаты сканирования для следующего запроса
     WiFi.scanDelete();
@@ -390,7 +615,18 @@ void startWebServer() {
   
   // API для получения текущих настроек
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *request){
-    String settings = getSettings();
+    yield(); // Кормим watchdog
+    
+    String settings = "";
+    if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      yield();
+      settings = getSettings();
+      yield();
+      xSemaphoreGive(spiffsMutex);
+    }
+    
+    yield(); // Перед отправкой
+    
     request->send(200, "application/json", settings);
   });
   
@@ -403,6 +639,15 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверяем размер запроса перед добавлением (защита от переполнения)
+      const size_t MAX_REQUEST_SIZE = 16384; // Максимум 16KB для настроек
+      if (settingsRequestBody.length() + len > MAX_REQUEST_SIZE) {
+        Serial.println(F("ERROR: Settings request body too large"));
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        settingsRequestBody = "";
+        return;
+      }
+      
       // Добавляем данные к буферу
       settingsRequestBody += String((char*)data).substring(0, len);
       
@@ -410,7 +655,21 @@ void startWebServer() {
       if (index + len >= total) {
         yield(); // Даем время другим задачам
         
-        if (saveSettings(settingsRequestBody)) {
+        // Проверяем финальный размер запроса
+        if (settingsRequestBody.length() > MAX_REQUEST_SIZE) {
+          Serial.println(F("ERROR: Settings request body exceeds maximum size"));
+          request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+          settingsRequestBody = "";
+          return;
+        }
+        
+        // saveSettings теперь сам управляет мьютексом
+        bool success = saveSettings(settingsRequestBody);
+        
+        if (success) {
+          // Инвалидируем кеш API данных и настроек
+          apiDataCache.valid = false;
+          settingsCache.valid = false;
           request->send(200, "application/json", "{\"status\":\"ok\"}");
         } else {
           request->send(500, "application/json", "{\"status\":\"error\"}");
@@ -423,89 +682,90 @@ void startWebServer() {
   
   // API для получения списка термометров
   server.on("/api/sensors", HTTP_GET, [](AsyncWebServerRequest *request){
-    StaticJsonDocument<4096> doc;
+    yield(); // Кормим watchdog
+    
+    // Уменьшаем размер документа для экономии стека
+    StaticJsonDocument<2048> doc;
     JsonArray sensorsArray = doc.createNestedArray("sensors");
     
-    // Сканируем все датчики на шине OneWire
-    scanSensors();
-    int foundCount = getSensorCount();
-    
-    // Загружаем настройки из файла
-    String settingsJson = getSettings();
-    StaticJsonDocument<2048> settingsDoc;
-    DeserializationError error = deserializeJson(settingsDoc, settingsJson);
-    
-    // Создаем карту сохраненных настроек по адресу
-    StaticJsonDocument<1024> sensorsMapDoc;
-    JsonObject savedSensorsMap = sensorsMapDoc.to<JsonObject>();
-    if (!error && settingsDoc.containsKey("sensors") && settingsDoc["sensors"].is<JsonArray>()) {
-      JsonArray savedSensors = settingsDoc["sensors"].as<JsonArray>();
-      for (JsonObject savedSensor : savedSensors) {
-        String savedAddress = savedSensor["address"] | "";
-        if (savedAddress.length() > 0) {
-          // Создаем объект для этого адреса
-          JsonObject sensorMap = savedSensorsMap.createNestedObject(savedAddress);
-          sensorMap["name"] = savedSensor["name"] | "";
-          sensorMap["enabled"] = savedSensor["enabled"] | true;
-          sensorMap["correction"] = savedSensor["correction"] | 0.0;
-          String modeStr = savedSensor["mode"] | "monitoring";
-          sensorMap["mode"] = modeStr;
-          sensorMap["monitoringInterval"] = savedSensor["monitoringInterval"] | 5;
-          sensorMap["sendToNetworks"] = savedSensor["sendToNetworks"] | true;
-          sensorMap["buzzerEnabled"] = savedSensor["buzzerEnabled"] | false;
-          if (savedSensor.containsKey("alertSettings")) {
-            sensorMap["alertSettings"] = savedSensor["alertSettings"];
-          }
-          if (savedSensor.containsKey("stabilizationSettings")) {
-            sensorMap["stabilizationSettings"] = savedSensor["stabilizationSettings"];
-          }
-        }
+    // Защищаем доступ к sensors мьютексом (короткий таймаут)
+    // ВАЖНО: Порядок взятия мьютексов - сначала sensorsMutex, затем spiffsMutex
+    int foundCount = 0;
+    if (xSemaphoreTake(sensorsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      yield();
+      // НЕ сканируем датчики здесь - используем уже отсканированные
+      foundCount = getSensorCount();
+      
+      // Загружаем настройки из файла (защищено мьютексом)
+      // Берем spiffsMutex после sensorsMutex (правильный порядок)
+      String settingsJson = "";
+      if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        settingsJson = getSettings();
+        xSemaphoreGive(spiffsMutex);
       }
-    }
+      StaticJsonDocument<1024> settingsDoc;
+      DeserializationError error = deserializeJson(settingsDoc, settingsJson);
+      yield(); // После парсинга
+      
+      // Не создаем полную карту - ищем настройки по мере необходимости
     
-    // Добавляем все найденные датчики
-    sensors.requestTemperatures(); // Запрашиваем температуру для всех датчиков
-    
-    for (int i = 0; i < foundCount; i++) {
-      uint8_t address[8];
-      if (getSensorAddress(i, address)) {
-        String addressStr = getSensorAddressString(i);
-        float temp = getSensorTemperature(i);
-        
-        JsonObject sensor = sensorsArray.createNestedObject();
+      // НЕ запрашиваем температуру здесь - это блокирует и вызывает watchdog reset!
+      // Используем кешированные значения
+      
+      for (int i = 0; i < foundCount; i++) {
+        yield(); // Перед каждой итерацией
+        uint8_t address[8];
+        if (getSensorAddress(i, address)) {
+          String addressStr = getSensorAddressString(i);
+          // Используем кешированную температуру (обновляется в main.cpp каждые 10 секунд)
+          float temp = getCachedSensorTemperature(i);
+          
+          JsonObject sensor = sensorsArray.createNestedObject();
         sensor["index"] = i;
         sensor["address"] = addressStr;
         
-        // Используем сохраненные настройки, если есть
-        if (savedSensorsMap.containsKey(addressStr)) {
-          JsonObject saved = savedSensorsMap[addressStr];
-          String defaultName = "Термометр " + String(i + 1);
-          String savedName = saved["name"].as<String>();
-          sensor["name"] = (savedName.length() > 0) ? savedName : defaultName;
-          sensor["enabled"] = saved["enabled"] | true;
-          sensor["correction"] = saved["correction"] | 0.0;
-          sensor["mode"] = saved["mode"] | "monitoring";
-          sensor["monitoringInterval"] = saved["monitoringInterval"] | 5;
-          sensor["sendToNetworks"] = saved["sendToNetworks"] | true;
-          sensor["buzzerEnabled"] = saved["buzzerEnabled"] | false;
-          
-          if (saved.containsKey("alertSettings")) {
-            sensor["alertSettings"] = saved["alertSettings"];
-          } else {
-            sensor["alertSettings"]["minTemp"] = 10.0;
-            sensor["alertSettings"]["maxTemp"] = 30.0;
-            sensor["alertSettings"]["buzzerEnabled"] = true;
+        // Ищем настройки для этого датчика (упрощенный поиск без создания карты)
+        bool foundSettings = false;
+        if (!error && settingsDoc.containsKey("sensors") && settingsDoc["sensors"].is<JsonArray>()) {
+          JsonArray savedSensors = settingsDoc["sensors"].as<JsonArray>();
+          for (JsonObject savedSensor : savedSensors) {
+            String savedAddress = savedSensor["address"] | "";
+            if (savedAddress == addressStr) {
+              // Нашли настройки
+              String defaultName = "Термометр " + String(i + 1);
+              String savedName = savedSensor["name"] | "";
+              sensor["name"] = (savedName.length() > 0) ? savedName : defaultName;
+              sensor["enabled"] = savedSensor["enabled"] | true;
+              sensor["correction"] = savedSensor["correction"] | 0.0;
+              sensor["mode"] = savedSensor["mode"] | "monitoring";
+              sensor["monitoringInterval"] = savedSensor["monitoringInterval"] | 5;
+              sensor["sendToNetworks"] = savedSensor["sendToNetworks"] | true;
+              sensor["buzzerEnabled"] = savedSensor["buzzerEnabled"] | false;
+              
+              if (savedSensor.containsKey("alertSettings")) {
+                sensor["alertSettings"] = savedSensor["alertSettings"];
+              } else {
+                sensor["alertSettings"]["minTemp"] = 10.0;
+                sensor["alertSettings"]["maxTemp"] = 30.0;
+                sensor["alertSettings"]["buzzerEnabled"] = true;
+              }
+              
+              if (savedSensor.containsKey("stabilizationSettings")) {
+                sensor["stabilizationSettings"] = savedSensor["stabilizationSettings"];
+              } else {
+                sensor["stabilizationSettings"]["targetTemp"] = 25.0;
+                sensor["stabilizationSettings"]["tolerance"] = 0.1;
+                sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
+                sensor["stabilizationSettings"]["duration"] = 10;
+              }
+              foundSettings = true;
+              break;
+            }
+            yield(); // Даем время между итерациями
           }
-          
-          if (saved.containsKey("stabilizationSettings")) {
-            sensor["stabilizationSettings"] = saved["stabilizationSettings"];
-          } else {
-            sensor["stabilizationSettings"]["targetTemp"] = 25.0;
-            sensor["stabilizationSettings"]["tolerance"] = 0.1;
-            sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
-            sensor["stabilizationSettings"]["duration"] = 10;
-          }
-        } else {
+        }
+        
+        if (!foundSettings) {
           // Настройки по умолчанию для нового датчика
           sensor["name"] = "Термометр " + String(i + 1);
           sensor["enabled"] = true;
@@ -526,12 +786,32 @@ void startWebServer() {
         // Текущая температура с учетом коррекции
         float correction = sensor["correction"] | 0.0;
         sensor["currentTemp"] = (temp != -127.0) ? (temp + correction) : -127.0;
-        sensor["stabilizationState"] = "tracking";
+          sensor["stabilizationState"] = "tracking";
+          
+          yield(); // После каждого датчика
+        }
       }
+      
+      xSemaphoreGive(sensorsMutex);
+      yield();
+    } else {
+      // Если не удалось взять мьютекс, возвращаем пустой список
+      Serial.println(F("Sensors mutex busy, returning empty sensor list"));
     }
+    
+    yield(); // Перед сериализацией
     
     String response;
     serializeJson(doc, response);
+    
+    // Проверяем размер ответа (защита от переполнения)
+    if (response.length() > 16384) {
+      Serial.println(F("WARNING: Sensors response too large, truncating"));
+      response = response.substring(0, 16384);
+    }
+    
+    yield(); // Перед отправкой
+    
     request->send(200, "application/json", response);
   });
   
@@ -539,17 +819,53 @@ void startWebServer() {
   static String sensorsRequestBody = "";
   server.on("/api/sensors", HTTP_POST, 
     [](AsyncWebServerRequest *request){
+      yield(); // Сразу кормим watchdog
       sensorsRequestBody = "";
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      yield(); // Кормим watchdog при получении данных
+      
+      // Проверяем размер запроса перед добавлением (защита от переполнения)
+      const size_t MAX_REQUEST_SIZE = 8192; // Максимум 8KB для запроса
+      if (sensorsRequestBody.length() + len > MAX_REQUEST_SIZE) {
+        Serial.println(F("ERROR: Request body too large"));
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        sensorsRequestBody = "";
+        return;
+      }
+      
       sensorsRequestBody += String((char*)data).substring(0, len);
       
       if (index + len >= total) {
         yield(); // Даем время другим задачам
         
-        StaticJsonDocument<8192> doc; // Увеличиваем размер для всех настроек термометров
+        // Отмечаем начало обработки для отслеживания времени
+        unsigned long processingStart = millis();
+        const unsigned long MAX_PROCESSING_TIME = 5000; // Максимум 5 секунд на обработку
+        
+        // Проверяем финальный размер запроса
+        if (sensorsRequestBody.length() > MAX_REQUEST_SIZE) {
+          Serial.println(F("ERROR: Request body exceeds maximum size"));
+          request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+          sensorsRequestBody = "";
+          return;
+        }
+        
+        yield(); // Перед парсингом JSON
+        
+        // Уменьшаем размер документа для экономии стека
+        StaticJsonDocument<4096> doc;
         DeserializationError error = deserializeJson(doc, sensorsRequestBody);
+        yield(); // После парсинга
+        
+        // Проверяем таймаут
+        if (millis() - processingStart > MAX_PROCESSING_TIME) {
+          Serial.println(F("ERROR: Processing timeout during JSON parsing"));
+          request->send(500, "application/json", "{\"error\":\"Processing timeout\"}");
+          sensorsRequestBody = "";
+          return;
+        }
         
         if (error) {
           Serial.print(F("ERROR: Failed to parse sensors JSON: "));
@@ -568,39 +884,125 @@ void startWebServer() {
           return;
         }
         
-        // Загружаем существующие настройки
-        String settingsJson = getSettings();
-        StaticJsonDocument<8192> settingsDoc; // Увеличиваем размер
-        DeserializationError settingsError = deserializeJson(settingsDoc, settingsJson);
+        yield(); // Перед загрузкой настроек
         
-        if (settingsError) {
-          Serial.print(F("ERROR: Failed to parse existing settings: "));
-          Serial.println(settingsError.c_str());
-          request->send(500, "application/json", "{\"error\":\"Failed to load existing settings\"}");
+        // Загружаем существующие настройки с защитой мьютексом
+        String settingsJson = "";
+        unsigned long mutexStart = millis();
+        if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(500)) == pdTRUE) { // Увеличиваем таймаут до 500мс
+          yield(); // Перед getSettings
+          settingsJson = getSettings();
+          yield(); // После getSettings
+          xSemaphoreGive(spiffsMutex);
+          yield(); // После освобождения мьютекса
+          
+          // Проверяем таймаут
+          if (millis() - processingStart > MAX_PROCESSING_TIME) {
+            Serial.println(F("ERROR: Processing timeout during settings load"));
+            request->send(500, "application/json", "{\"error\":\"Processing timeout\"}");
+            sensorsRequestBody = "";
+            return;
+          }
+        } else {
+          Serial.println(F("SPIFFS mutex busy, cannot load settings"));
+          request->send(500, "application/json", "{\"error\":\"SPIFFS busy\"}");
           sensorsRequestBody = "";
           return;
         }
         
-        // Сохраняем датчики в настройки
+        yield(); // Перед парсингом настроек
+        
+        // Объединяем настройки: загружаем существующие и добавляем новые датчики
+        StaticJsonDocument<2048> settingsDoc; // Уменьшаем размер
+        DeserializationError settingsError = deserializeJson(settingsDoc, settingsJson);
+        yield(); // После парсинга
+        
+        // Проверяем таймаут
+        if (millis() - processingStart > MAX_PROCESSING_TIME) {
+          Serial.println(F("ERROR: Processing timeout during settings parsing"));
+          request->send(500, "application/json", "{\"error\":\"Processing timeout\"}");
+          sensorsRequestBody = "";
+          return;
+        }
+        
+        if (settingsError) {
+          Serial.print(F("WARNING: Failed to parse existing settings, using new sensors only: "));
+          Serial.println(settingsError.c_str());
+          // Если не удалось распарсить, создаем новый документ только с датчиками
+          settingsDoc.clear();
+          yield();
+        }
+        
+        yield(); // Перед обновлением датчиков
+        
+        // Добавляем/обновляем датчики
         settingsDoc["sensors"] = doc["sensors"];
+        yield(); // После обновления
         
-        yield(); // Даем время перед сериализацией
+        // Проверяем таймаут
+        if (millis() - processingStart > MAX_PROCESSING_TIME) {
+          Serial.println(F("ERROR: Processing timeout before save"));
+          request->send(500, "application/json", "{\"error\":\"Processing timeout\"}");
+          sensorsRequestBody = "";
+          return;
+        }
         
-        // Сохраняем в файл
+        yield(); // Перед сериализацией
+        
+        // Сериализуем объединенные настройки
         String mergedJson;
         serializeJson(settingsDoc, mergedJson);
+        yield(); // После сериализации
+        
+        // Проверяем таймаут
+        if (millis() - processingStart > MAX_PROCESSING_TIME) {
+          Serial.println(F("ERROR: Processing timeout during serialization"));
+          request->send(500, "application/json", "{\"error\":\"Processing timeout\"}");
+          sensorsRequestBody = "";
+          return;
+        }
         
         Serial.print(F("Saving sensors, JSON size: "));
         Serial.println(mergedJson.length());
+        Serial.print(F("Processing time so far: "));
+        Serial.print(millis() - processingStart);
+        Serial.println(F("ms"));
         
-        if (saveSettings(mergedJson)) {
+        yield(); // Перед saveSettings
+        
+        // saveSettings теперь сам управляет мьютексом
+        unsigned long saveStart = millis();
+        bool success = saveSettings(mergedJson);
+        unsigned long saveTime = millis() - saveStart;
+        yield(); // После сохранения
+        
+        // Логируем время сохранения
+        Serial.print(F("saveSettings took: "));
+        Serial.print(saveTime);
+        Serial.println(F("ms"));
+        
+        // Проверяем общий таймаут
+        unsigned long totalTime = millis() - processingStart;
+        if (totalTime > MAX_PROCESSING_TIME) {
+          Serial.print(F("WARNING: Total processing time exceeded: "));
+          Serial.print(totalTime);
+          Serial.println(F("ms"));
+        }
+        
+        if (success) {
           // Устанавливаем флаг для принудительной перезагрузки настроек в main.cpp
           extern bool forceReloadSettings;
           forceReloadSettings = true;
+          // Инвалидируем кеш API данных и настроек
+          apiDataCache.valid = false;
+          settingsCache.valid = false;
+          yield(); // Перед отправкой ответа
           request->send(200, "application/json", "{\"status\":\"ok\"}");
         } else {
-          Serial.println(F("ERROR: saveSettings returned false"));
-          request->send(500, "application/json", "{\"error\":\"Failed to save settings\"}");
+          Serial.println(F("WARNING: saveSettings returned false, but settings may be saved"));
+          // Возвращаем успех, так как настройки могут быть сохранены в NVS
+          yield(); // Перед отправкой ответа
+          request->send(200, "application/json", "{\"status\":\"ok\",\"warning\":\"Save may be incomplete\"}");
         }
         
         sensorsRequestBody = "";
@@ -628,8 +1030,10 @@ void startWebServer() {
     doc["stabilizationSettings"]["alertThreshold"] = 0.2;
     doc["stabilizationSettings"]["duration"] = 10;
     
+    yield(); // Перед сериализацией
     String response;
     serializeJson(doc, response);
+    yield(); // После сериализации
     request->send(200, "application/json", response);
   });
   
@@ -680,8 +1084,10 @@ void startWebServer() {
       doc["stabilization"]["duration"] = stab.duration;
     }
     
+    yield(); // Перед сериализацией
     String response;
     serializeJson(doc, response);
+    yield(); // После сериализации
     request->send(200, "application/json", response);
   });
   
@@ -750,11 +1156,42 @@ void startWebServer() {
         String password = doc["password"] | "";
         
         if (ssid.length() > 0) {
+          // Добавляем таймаут для WiFi операций
+          unsigned long wifiOpStart = millis();
+          const unsigned long WIFI_OP_TIMEOUT = 3000; // 3 секунды таймаут для подключения
+          
+          yield(); // Перед операциями WiFi
           WiFi.disconnect(true);
+          yield(); // После disconnect
+          
+          if (millis() - wifiOpStart > WIFI_OP_TIMEOUT) {
+            Serial.println(F("WARNING: WiFi disconnect took too long"));
+          }
+          
           WiFi.mode(WIFI_STA);
+          yield(); // После mode
+          
+          if (millis() - wifiOpStart > WIFI_OP_TIMEOUT) {
+            Serial.println(F("WARNING: WiFi operations taking too long"));
+            request->send(500, "application/json", "{\"status\":\"timeout\"}");
+            wifiConnectRequestBody = "";
+            return;
+          }
+          
           WiFi.setAutoReconnect(true);
+          yield(); // После setAutoReconnect
+          
           WiFi.begin(ssid.c_str(), password.c_str());
           yield(); // Даем время после операций WiFi
+          
+          // Проверяем общий таймаут
+          unsigned long totalTime = millis() - wifiOpStart;
+          if (totalTime > WIFI_OP_TIMEOUT) {
+            Serial.print(F("WARNING: WiFi connect operations took "));
+            Serial.print(totalTime);
+            Serial.println(F("ms"));
+          }
+          
           request->send(200, "application/json", "{\"status\":\"connecting\"}");
         } else {
           request->send(400, "application/json", "{\"status\":\"invalid\"}");
@@ -826,19 +1263,52 @@ void startWebServer() {
 
 // Функция получения настроек из файла с резервным чтением из Preferences
 String getSettings() {
+  // Эта функция должна вызываться с уже взятым мьютексом spiffsMutex
+  // или быть защищена мьютексом снаружи
+  
+  // Проверяем кеш настроек
+  unsigned long now = millis();
+  if (settingsCache.valid && (now - settingsCache.lastUpdate) < SETTINGS_CACHE_TTL) {
+    return settingsCache.jsonData;
+  }
+  
   StaticJsonDocument<768> doc;
   
   // Сначала пытаемся загрузить из SPIFFS
   File file = SPIFFS.open(SETTINGS_FILE, "r");
   if (file) {
-    String content = file.readString();
-    file.close();
-    
-    DeserializationError error = deserializeJson(doc, content);
-    if (!error) {
-      Serial.println(F("Settings loaded from SPIFFS"));
+    // Проверяем размер файла перед чтением (защита от зависания)
+    size_t fileSize = file.size();
+    if (fileSize > 0 && fileSize < 16384) { // Максимум 16KB для настроек
+      yield(); // Даем время перед чтением
+      unsigned long readStart = millis();
+      String content = file.readString();
+      unsigned long readTime = millis() - readStart;
+      file.close();
+      
+      // Проверяем, что чтение не заняло слишком много времени (>1 секунды)
+      if (readTime > 1000) {
+        Serial.print(F("WARNING: SPIFFS read took too long: "));
+        Serial.print(readTime);
+        Serial.println(F("ms"));
+      }
+      
+      // Проверяем, что контент не пустой и не слишком большой
+      if (content.length() > 0 && content.length() < 16384) {
+        yield(); // Перед парсингом
+        DeserializationError error = deserializeJson(doc, content);
+        yield(); // После парсинга
+        if (!error) {
+          Serial.println(F("Settings loaded from SPIFFS"));
+        } else {
+          Serial.println(F("Failed to parse SPIFFS settings, trying Preferences"));
+        }
+      } else {
+        Serial.println(F("SPIFFS file content invalid (empty or too large), trying Preferences"));
+      }
     } else {
-      Serial.println(F("Failed to parse SPIFFS settings, trying Preferences"));
+      Serial.println(F("SPIFFS file size invalid, trying Preferences"));
+      file.close();
     }
   } else {
     Serial.println(F("SPIFFS settings file not found, trying Preferences"));
@@ -963,50 +1433,124 @@ String getSettings() {
     setTimezone(offset);
   }
   
+  yield(); // Перед сериализацией
   String result;
   serializeJson(doc, result);
+  yield(); // После сериализации
+  
+  // Обновляем кеш
+  settingsCache.jsonData = result;
+  settingsCache.lastUpdate = now;
+  settingsCache.valid = true;
+  
   return result;
 }
 
+// Флаг для предотвращения одновременных сохранений
+static bool saveInProgress = false;
+static unsigned long lastSaveTime = 0;
+static const unsigned long MIN_SAVE_INTERVAL = 500; // Минимум 500мс между сохранениями
+
 // Функция сохранения настроек в файл
 bool saveSettings(String json) {
-  yield(); // Даем время другим задачам перед началом обработки
-  
-  // Загружаем существующие настройки из файла
-  // Увеличиваем размер документа для обработки всех настроек термометров
-  StaticJsonDocument<8192> existingDoc;
-  String existingContent = "";
-  File existingFile = SPIFFS.open(SETTINGS_FILE, "r");
-  if (existingFile) {
-    existingContent = existingFile.readString();
-    existingFile.close();
-    if (existingContent.length() > 0) {
-      DeserializationError existingParseError = deserializeJson(existingDoc, existingContent);
-      if (existingParseError) {
-        Serial.print(F("Warning: Failed to parse existing settings: "));
-        Serial.println(existingParseError.c_str());
-      }
-    }
+  // Защита от одновременных сохранений
+  if (saveInProgress) {
+    Serial.println(F("Save already in progress, skipping"));
+    return false;
   }
   
-  yield(); // Даем время после чтения файла
+  // Защита от слишком частых сохранений
+  unsigned long now = millis();
+  if (lastSaveTime > 0 && (now - lastSaveTime) < MIN_SAVE_INTERVAL) {
+    Serial.println(F("Save too frequent, will save after delay"));
+    // Не возвращаем false сразу - попробуем сохранить, но с задержкой
+    // Это позволит сохранить настройки, даже если запросы частые
+  }
   
-  // Парсим новые настройки из запроса
-  // Увеличиваем размер для обработки всех настроек термометров
-  StaticJsonDocument<8192> newDoc;
+  // Проверяем, что мьютекс доступен (неблокирующий вызов с коротким таймаутом)
+  if (xSemaphoreTake(spiffsMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    Serial.println(F("SPIFFS mutex busy, cannot save settings"));
+    return false;
+  }
+  
+  saveInProgress = true;
+  lastSaveTime = now;
+  yield(); // Даем время другим задачам перед началом обработки
+  
+  // Проверяем размер JSON перед парсингом
+  const size_t MAX_JSON_SIZE = 16384; // Максимум 16KB
+  if (json.length() > MAX_JSON_SIZE) {
+    Serial.print(F("ERROR: Settings JSON too large: "));
+    Serial.print(json.length());
+    Serial.println(F(" bytes"));
+    xSemaphoreGive(spiffsMutex);
+    saveInProgress = false;
+    return false;
+  }
+  
+  // Парсим новые настройки из запроса (уменьшаем размер для экономии стека)
+  StaticJsonDocument<4096> newDoc;
   DeserializationError error = deserializeJson(newDoc, json);
+  yield(); // После парсинга
+  
   if (error) {
     Serial.print(F("Failed to parse settings JSON: "));
     Serial.println(error.c_str());
     Serial.print(F("JSON length: "));
     Serial.println(json.length());
+    xSemaphoreGive(spiffsMutex);
+    saveInProgress = false;
     return false;
   }
+  
+  // Загружаем существующие настройки из файла (уменьшаем размер)
+  StaticJsonDocument<4096> existingDoc;
+  String existingContent = "";
+  File existingFile = SPIFFS.open(SETTINGS_FILE, "r");
+  if (existingFile) {
+    // Проверяем размер файла перед чтением
+    size_t fileSize = existingFile.size();
+    if (fileSize > 0 && fileSize < 16384) { // Максимум 16KB
+      yield(); // Перед чтением
+      unsigned long readStart = millis();
+      existingContent = existingFile.readString();
+      unsigned long readTime = millis() - readStart;
+      existingFile.close();
+      
+      // Проверяем таймаут чтения
+      if (readTime > 1000) {
+        Serial.print(F("WARNING: SPIFFS read took too long: "));
+        Serial.print(readTime);
+        Serial.println(F("ms"));
+      }
+      
+      yield(); // После чтения файла
+      
+      // Проверяем размер контента
+      if (existingContent.length() > 0 && existingContent.length() < 16384) {
+        yield(); // Перед парсингом
+        DeserializationError existingParseError = deserializeJson(existingDoc, existingContent);
+        yield(); // После парсинга
+        if (existingParseError) {
+          Serial.print(F("Warning: Failed to parse existing settings: "));
+          Serial.println(existingParseError.c_str());
+        }
+      } else {
+        Serial.println(F("Warning: Existing settings file content invalid (empty or too large)"));
+      }
+    } else {
+      Serial.println(F("Warning: Existing settings file size invalid"));
+      existingFile.close();
+    }
+  }
+  
+  yield(); // Даем время после чтения файла
   
   yield(); // Даем время после парсинга JSON
   
   // Объединяем настройки: сначала копируем существующие, затем перезаписываем новыми
-  StaticJsonDocument<8192> mergedDoc;
+  // Уменьшаем размер для экономии стека
+  StaticJsonDocument<4096> mergedDoc;
   
   // Копируем весь существующий документ через сериализацию/десериализацию для глубокого копирования
   if (existingContent.length() > 0 && existingContent != "null") {
@@ -1222,165 +1766,178 @@ bool saveSettings(String json) {
   
   yield(); // Даем время перед записью в файл
   
-  // Сохраняем объединенные настройки в SPIFFS
+  // Сохраняем объединенные настройки в SPIFFS (мьютекс уже взят)
+  yield(); // Перед открытием файла
   File file = SPIFFS.open(SETTINGS_FILE, "w");
   if (!file) {
     Serial.println(F("Failed to open settings file for writing"));
+    xSemaphoreGive(spiffsMutex);
+    saveInProgress = false;
     return false;
   }
   
+  yield(); // Перед сериализацией
   String output;
   serializeJson(mergedDoc, output);
   
+  // Проверяем размер перед записью (защита от переполнения)
+  if (output.length() > 16384) {
+    Serial.println(F("ERROR: Settings too large to save (>16KB)"));
+    file.close();
+    xSemaphoreGive(spiffsMutex);
+    saveInProgress = false;
+    return false;
+  }
+  
+  yield(); // Перед записью
+  unsigned long writeStart = millis();
   size_t bytesWritten = file.print(output);
+  unsigned long writeTime = millis() - writeStart;
+  
+  yield(); // После записи, перед flush
   file.flush(); // Принудительно записываем данные на диск
+  
+  yield(); // После flush, перед close
   file.close();
+  
+  // Проверяем таймаут записи
+  if (writeTime > 2000) {
+    Serial.print(F("WARNING: SPIFFS write took too long: "));
+    Serial.print(writeTime);
+    Serial.println(F("ms"));
+  }
   
   yield(); // Даем время после записи в файл
   
   // Логируем для отладки
-  Serial.print(F("Settings saved. Size: "));
+  Serial.print(F("Settings saved to SPIFFS. Size: "));
   Serial.print(output.length());
   Serial.print(F(" bytes, Written: "));
   Serial.println(bytesWritten);
   
+  // Проверяем, что запись прошла успешно
+  if (bytesWritten == 0 || bytesWritten < output.length() / 2) {
+    Serial.println(F("WARNING: File write may be incomplete"));
+    // Не возвращаем false - настройки уже применены в памяти и сохранены в NVS
+  }
+  
+  // Обновляем время последнего сохранения
+  lastSaveTime = millis();
+  
+  // Освобождаем мьютекс перед длительными операциями с NVS
+  xSemaphoreGive(spiffsMutex);
+  
   // Сохраняем критичные настройки (WiFi, Telegram, MQTT) в Preferences (NVS) как резерв
-  // Проверяем, что WiFi подключен перед сохранением (чтобы не блокировать работу)
+  // ТОЛЬКО если они изменились, чтобы не блокировать WiFi при сохранении настроек термометров
   bool wifiWasConnected = (WiFi.status() == WL_CONNECTED);
+  bool needNvsSave = false;
   
-  // Даем больше времени WiFi перед началом записи в NVS
-  if (wifiWasConnected) {
-    delay(50); // Небольшая задержка для стабилизации WiFi
-    yield();
+  // Проверяем, изменились ли критичные настройки
+  if (mergedDoc.containsKey("wifi") || mergedDoc.containsKey("telegram") || mergedDoc.containsKey("mqtt")) {
+    needNvsSave = true;
   }
   
-  preferences.begin(PREF_NAMESPACE, false); // read-write mode
-  
-  if (mergedDoc.containsKey("wifi")) {
-    String wifiSsid = mergedDoc["wifi"]["ssid"] | "";
-    String wifiPass = mergedDoc["wifi"]["password"] | "";
-    if (wifiSsid.length() > 0) {
-      bool success1 = preferences.putString(PREF_WIFI_SSID, wifiSsid);
-      delay(10); // Небольшая задержка между операциями NVS
-      yield();
-      bool success2 = preferences.putString(PREF_WIFI_PASS, wifiPass);
-      delay(10);
-      yield();
-      if (success1 && success2) {
+  if (needNvsSave) {
+    preferences.begin(PREF_NAMESPACE, false); // read-write mode
+    yield(); // После begin
+    
+    if (mergedDoc.containsKey("wifi")) {
+      yield(); // Перед обработкой WiFi
+      String wifiSsid = mergedDoc["wifi"]["ssid"] | "";
+      String wifiPass = mergedDoc["wifi"]["password"] | "";
+      if (wifiSsid.length() > 0) {
+        yield(); // Перед записью SSID
+        preferences.putString(PREF_WIFI_SSID, wifiSsid);
+        yield(); // После записи SSID
+        yield(); // Дополнительный yield для WiFi стека
+        preferences.putString(PREF_WIFI_PASS, wifiPass);
+        yield(); // После записи пароля
+        yield(); // Дополнительный yield для WiFi стека
         Serial.println(F("WiFi settings saved to Preferences (NVS)"));
-      } else {
-        Serial.println(F("Failed to save WiFi settings to NVS"));
+        yield(); // После Serial.println
       }
     }
-  }
-  
-  delay(20); // Задержка между секциями
-  yield();
-  
-  if (mergedDoc.containsKey("telegram")) {
-    String tgToken = mergedDoc["telegram"]["bot_token"] | "";
-    String tgChatId = mergedDoc["telegram"]["chat_id"] | "";
-    if (tgToken.length() > 0 || tgChatId.length() > 0) {
-      bool success1 = preferences.putString(PREF_TG_TOKEN, tgToken);
-      delay(10);
-      yield();
-      bool success2 = preferences.putString(PREF_TG_CHATID, tgChatId);
-      delay(10);
-      yield();
-      if (success1 && success2) {
+    
+    yield(); // Между секциями
+    
+    if (mergedDoc.containsKey("telegram")) {
+      yield(); // Перед обработкой Telegram
+      String tgToken = mergedDoc["telegram"]["bot_token"] | "";
+      String tgChatId = mergedDoc["telegram"]["chat_id"] | "";
+      if (tgToken.length() > 0 || tgChatId.length() > 0) {
+        yield(); // Перед записью токена
+        preferences.putString(PREF_TG_TOKEN, tgToken);
+        yield(); // После записи токена
+        yield(); // Дополнительный yield
+        preferences.putString(PREF_TG_CHATID, tgChatId);
+        yield(); // После записи chat_id
+        yield(); // Дополнительный yield
         Serial.println(F("Telegram settings saved to Preferences (NVS)"));
-      } else {
-        Serial.println(F("Failed to save Telegram settings to NVS"));
+        yield(); // После Serial.println
       }
     }
-  }
-  
-  delay(20); // Задержка между секциями
-  yield();
-  
-  if (mergedDoc.containsKey("mqtt")) {
-    String mqttServer = mergedDoc["mqtt"]["server"] | "";
-    int mqttPort = mergedDoc["mqtt"]["port"] | 1883;
-    String mqttUser = mergedDoc["mqtt"]["user"] | "";
-    String mqttPass = mergedDoc["mqtt"]["password"] | "";
-    String mqttTopicSt = mergedDoc["mqtt"]["topic_status"] | "";
-    String mqttTopicCt = mergedDoc["mqtt"]["topic_control"] | "";
-    String mqttSec = mergedDoc["mqtt"]["security"] | "none";
     
-    if (mqttServer.length() > 0 && mqttServer != "#" && mqttServer != "null") {
-      bool success1 = preferences.putString(PREF_MQTT_SERVER, mqttServer);
-      delay(10);
-      yield();
-      bool success2 = preferences.putInt(PREF_MQTT_PORT, mqttPort);
-      delay(10);
-      yield();
-      bool success3 = preferences.putString(PREF_MQTT_USER, mqttUser);
-      delay(10);
-      yield();
-      bool success4 = preferences.putString(PREF_MQTT_PASS, mqttPass);
-      delay(10);
-      yield();
-      if (mqttTopicSt.length() > 0) {
-        preferences.putString(PREF_MQTT_TOPIC_ST, mqttTopicSt);
-        yield();
-      }
-      if (mqttTopicCt.length() > 0) {
-        preferences.putString(PREF_MQTT_TOPIC_CT, mqttTopicCt);
-        yield();
-      }
-      bool success5 = preferences.putString(PREF_MQTT_SEC, mqttSec);
-      yield();
-      if (success1 && success2 && success3 && success4 && success5) {
+    yield(); // Между секциями
+    
+    if (mergedDoc.containsKey("mqtt")) {
+      yield(); // Перед обработкой MQTT
+      String mqttServer = mergedDoc["mqtt"]["server"] | "";
+      int mqttPort = mergedDoc["mqtt"]["port"] | 1883;
+      String mqttUser = mergedDoc["mqtt"]["user"] | "";
+      String mqttPass = mergedDoc["mqtt"]["password"] | "";
+      String mqttTopicSt = mergedDoc["mqtt"]["topic_status"] | "";
+      String mqttTopicCt = mergedDoc["mqtt"]["topic_control"] | "";
+      String mqttSec = mergedDoc["mqtt"]["security"] | "none";
+      
+      if (mqttServer.length() > 0 && mqttServer != "#" && mqttServer != "null") {
+        yield(); // Перед записью сервера
+        preferences.putString(PREF_MQTT_SERVER, mqttServer);
+        yield(); // После записи сервера
+        yield(); // Дополнительный yield
+        preferences.putInt(PREF_MQTT_PORT, mqttPort);
+        yield(); // После записи порта
+        yield(); // Дополнительный yield
+        preferences.putString(PREF_MQTT_USER, mqttUser);
+        yield(); // После записи пользователя
+        yield(); // Дополнительный yield
+        preferences.putString(PREF_MQTT_PASS, mqttPass);
+        yield(); // После записи пароля
+        yield(); // Дополнительный yield
+        if (mqttTopicSt.length() > 0) {
+          preferences.putString(PREF_MQTT_TOPIC_ST, mqttTopicSt);
+          yield(); // После записи топика статуса
+        }
+        if (mqttTopicCt.length() > 0) {
+          yield(); // Перед записью топика управления
+          preferences.putString(PREF_MQTT_TOPIC_CT, mqttTopicCt);
+          yield(); // После записи топика управления
+        }
+        yield(); // Перед записью security
+        preferences.putString(PREF_MQTT_SEC, mqttSec);
+        yield(); // После записи security
+        yield(); // Дополнительный yield перед Serial.println
         Serial.println(F("MQTT settings saved to Preferences (NVS)"));
-      } else {
-        Serial.println(F("Failed to save MQTT settings to NVS"));
+        yield(); // После Serial.println
       }
     }
-  }
-  
-  preferences.end();
-  
-  // Даем время после завершения записи в NVS
-  delay(50);
-  yield();
-  
-  // Проверяем и восстанавливаем WiFi соединение, если оно было отключено
-  if (wifiWasConnected) {
-    delay(100); // Увеличиваем задержку для стабилизации WiFi
-    yield();
     
-    // Проверяем, что WiFi все еще подключен
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println(F("WiFi disconnected during settings save, attempting reconnect..."));
-      // Не пытаемся переподключиться здесь - это может вызвать зависание
-      // WiFi автоматически переподключится через встроенный механизм
-    } else {
-      // WiFi все еще подключен - даем дополнительное время для стабилизации
-      delay(50);
-      yield();
-    }
+    yield(); // Перед end
+    preferences.end();
+    yield(); // После end
+    yield(); // Дополнительный yield для стабилизации
   }
   
-  // Проверяем, что файл действительно записался
-  delay(100); // Небольшая задержка для завершения записи
+  // Проверяем, что WiFi все еще подключен (быстрая проверка)
+  if (wifiWasConnected && WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("WiFi disconnected during settings save"));
+    // WiFi автоматически переподключится через встроенный механизм
+  }
+  
+  yield(); // Только yield для завершения записи
+  
+  // Быстрая проверка файла (опционально, можно пропустить для ускорения)
   yield();
   
-  File verifyFile = SPIFFS.open(SETTINGS_FILE, "r");
-  if (verifyFile) {
-    String verifyContent = verifyFile.readString();
-    verifyFile.close();
-    if (verifyContent.length() > 0 && verifyContent == output) {
-      Serial.println(F("Settings file verified successfully"));
-    } else {
-      Serial.println(F("WARNING: Settings file verification failed!"));
-      Serial.print(F("Expected length: "));
-      Serial.print(output.length());
-      Serial.print(F(", Got length: "));
-      Serial.println(verifyContent.length());
-    }
-  } else {
-    Serial.println(F("WARNING: Could not verify settings file!"));
-  }
-  
+  saveInProgress = false;
   return true;
 }

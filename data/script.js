@@ -34,15 +34,29 @@ function formatTime(date) {
 // Функция получения данных с сервера
 async function fetchData() {
     try {
+        console.log('Fetching data from', API_ENDPOINT);
         const response = await fetch(API_ENDPOINT);
+        console.log('Response status:', response.status, response.statusText);
+        
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        const data = await response.json();
+        
+        const text = await response.text();
+        console.log('Response text length:', text.length);
+        console.log('Response text (first 500 chars):', text.substring(0, 500));
+        
+        const data = JSON.parse(text);
+        console.log('Parsed data:', data);
+        console.log('Sensors count:', data.sensors ? data.sensors.length : 0);
+        console.log('MQTT:', data.mqtt);
+        console.log('Telegram:', data.telegram);
+        
         updateUI(data);
         elements.lastUpdate.textContent = formatTime(new Date());
     } catch (error) {
         console.error('Error fetching data:', error);
+        console.error('Error details:', error.message, error.stack);
         showError();
     }
 }
@@ -74,7 +88,9 @@ function updateUI(data) {
     updateServiceStatusDots(data.mqtt, data.telegram);
     
     // Обновляем данные термометров (используем адрес как ключ)
+    console.log('updateUI: sensors data:', data.sensors);
     if (data.sensors && Array.isArray(data.sensors)) {
+        console.log('updateUI: Found', data.sensors.length, 'sensors');
         data.sensors.forEach(sensor => {
             const key = sensor.address || sensor.index || sensor.id;
             sensorsData[key] = {
@@ -83,6 +99,8 @@ function updateUI(data) {
             };
         });
         renderSensorCells();
+    } else {
+        console.warn('updateUI: No sensors array or invalid format:', data.sensors);
     }
 }
 
@@ -171,12 +189,19 @@ async function loadSensors() {
 
 // Рендеринг ячеек термометров
 function renderSensorCells() {
-    if (!elements.sensorsGrid) return;
+    if (!elements.sensorsGrid) {
+        console.warn('renderSensorCells: sensorsGrid element not found');
+        return;
+    }
+    
+    console.log('renderSensorCells: sensors array length:', sensors.length);
+    console.log('renderSensorCells: sensorsData keys:', Object.keys(sensorsData));
     
     elements.sensorsGrid.innerHTML = '';
     
     // Фильтруем только включенные термометры
     const enabledSensors = sensors.filter(s => s.enabled);
+    console.log('renderSensorCells: enabled sensors count:', enabledSensors.length);
     
     enabledSensors.forEach(sensor => {
         // Используем адрес, индекс или id как ключ
@@ -234,10 +259,19 @@ function renderSensorCells() {
         sendButton.onclick = (e) => { e.stopPropagation(); toggleSendToNetworks(sensorKey); };
         sendButton.innerHTML = `<span>📤</span><span>${sensor.sendToNetworks ? 'Вкл' : 'Выкл'}</span>`;
         
+        // Синхронизируем buzzerEnabled с настройками режима
+        let actualBuzzerEnabled = sensor.buzzerEnabled;
+        if (sensor.mode === 'alert' && sensor.alertSettings) {
+            actualBuzzerEnabled = sensor.alertSettings.buzzerEnabled !== false;
+        } else if (sensor.mode === 'stabilization' && sensor.stabilizationSettings) {
+            // Для стабилизации buzzerEnabled берется из основного поля
+            actualBuzzerEnabled = sensor.buzzerEnabled !== false;
+        }
+        
         const buzzerButton = document.createElement('button');
-        buzzerButton.className = `sensor-buzzer-button ${sensor.buzzerEnabled ? 'active' : ''}`;
+        buzzerButton.className = `sensor-buzzer-button ${actualBuzzerEnabled ? 'active' : ''}`;
         buzzerButton.onclick = (e) => { e.stopPropagation(); toggleBuzzer(sensorKey); };
-        const buzzerIcon = sensor.buzzerEnabled ? '🔊' : '🔇';
+        const buzzerIcon = actualBuzzerEnabled ? '🔊' : '🔇';
         buzzerButton.innerHTML = `<span>${buzzerIcon}</span>`;
         
         buttonsContainer.appendChild(sendButton);
@@ -392,31 +426,46 @@ async function saveSensorSettings() {
             }
         }));
         
-        // Сохраняем все датчики
-        const response = await fetch('/api/sensors', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ sensors: sensorsToSave })
-        });
+        // Сохраняем все датчики с таймаутом
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 секунд таймаут
         
-        if (response.ok) {
-            // Перезагружаем данные датчиков с сервера
-            await loadSensors();
-            // Обновляем отображение на главном экране
-            renderSensorCells();
-            // Закрываем модальное окно
-            closeSensorSettings();
-            // Показываем сообщение об успехе
-            console.log('Настройки термометра сохранены');
-        } else {
-            alert('Ошибка сохранения настроек');
+        try {
+            const response = await fetch('/api/sensors', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ sensors: sensorsToSave }),
+                signal: controller.signal
+            });
+            
+            clearTimeout(timeoutId);
+        
+            if (response.ok) {
+                // Перезагружаем данные датчиков с сервера
+                await loadSensors();
+                // Обновляем отображение на главном экране
+                renderSensorCells();
+                // Закрываем модальное окно
+                closeSensorSettings();
+                // Показываем сообщение об успехе
+                console.log('Настройки термометра сохранены');
+            } else {
+                const errorText = await response.text();
+                console.error('Error response:', errorText);
+                alert('Ошибка сохранения настроек: ' + (errorText || response.status));
+            }
+        } catch (error) {
+            clearTimeout(timeoutId);
+            if (error.name === 'AbortError') {
+                console.error('Request timeout');
+                alert('Таймаут при сохранении настроек. Попробуйте еще раз.');
+            } else {
+                console.error('Error saving sensor settings:', error);
+                alert('Ошибка сохранения настроек: ' + error.message);
+            }
         }
-    } catch (error) {
-        console.error('Error saving sensor settings:', error);
-        alert('Ошибка сохранения настроек');
-    }
 }
 
 // Переключение отправки данных
@@ -447,7 +496,18 @@ function toggleBuzzer(sensorId) {
     const sensor = sensors.find(s => (s.address === sensorId || s.index === sensorId || s.id === sensorId));
     if (!sensor) return;
     
-    sensor.buzzerEnabled = !sensor.buzzerEnabled;
+    // Обновляем buzzerEnabled в зависимости от режима
+    if (sensor.mode === 'alert') {
+        if (!sensor.alertSettings) sensor.alertSettings = {};
+        sensor.alertSettings.buzzerEnabled = !(sensor.alertSettings.buzzerEnabled !== false);
+        sensor.buzzerEnabled = sensor.alertSettings.buzzerEnabled; // Синхронизируем
+    } else {
+        sensor.buzzerEnabled = !sensor.buzzerEnabled;
+        // Если есть alertSettings, синхронизируем и их
+        if (sensor.alertSettings) {
+            sensor.alertSettings.buzzerEnabled = sensor.buzzerEnabled;
+        }
+    }
     
     // Сохраняем на сервер
     fetch('/api/sensors', {
@@ -456,6 +516,15 @@ function toggleBuzzer(sensorId) {
             'Content-Type': 'application/json'
         },
         body: JSON.stringify({ sensors: sensors })
+    }).then(response => {
+        if (!response.ok) {
+            console.error('Error saving sensor settings');
+        }
+        return response.json();
+    }).then(data => {
+        if (data.error) {
+            console.error('Save error:', data.error);
+        }
     }).catch(error => {
         console.error('Error saving sensor:', error);
     });
