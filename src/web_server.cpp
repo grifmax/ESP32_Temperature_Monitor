@@ -48,6 +48,9 @@ String pendingNvsData = "";
 #define PREF_MQTT_USER "mqtt_user"
 #define PREF_MQTT_PASS "mqtt_pass"
 #define PREF_MQTT_TOPIC_ST "mqtt_topic_st"
+
+// Лимит размера POST запросов (16KB - достаточно для настроек, защита от переполнения)
+#define MAX_REQUEST_BODY_SIZE 16384
 #define PREF_MQTT_TOPIC_CT "mqtt_topic_ct"
 #define PREF_MQTT_SEC "mqtt_sec"
 
@@ -420,9 +423,14 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка лимита размера запроса
+      if (total > MAX_REQUEST_BODY_SIZE) {
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        return;
+      }
       // Добавляем данные к буферу
       settingsRequestBody += String((char*)data).substring(0, len);
-      
+
       // Если это последний фрагмент, обрабатываем
       if (index + len >= total) {
         yield(); // Даем время другим задачам
@@ -560,11 +568,16 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка лимита размера запроса
+      if (total > MAX_REQUEST_BODY_SIZE) {
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        return;
+      }
       sensorsRequestBody += String((char*)data).substring(0, len);
-      
+
       if (index + len >= total) {
         yield(); // Даем время другим задачам
-        
+
         StaticJsonDocument<8192> doc; // Увеличиваем размер для всех настроек термометров
         DeserializationError error = deserializeJson(doc, sensorsRequestBody);
         
@@ -658,8 +671,13 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка лимита размера запроса
+      if (total > MAX_REQUEST_BODY_SIZE) {
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        return;
+      }
       sensorRequestBody += String((char*)data).substring(0, len);
-      
+
       if (index + len >= total) {
         String sensorId = request->pathArg(0);
         int id = sensorId.toInt();
@@ -710,11 +728,16 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка лимита размера запроса
+      if (total > MAX_REQUEST_BODY_SIZE) {
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        return;
+      }
       modeRequestBody += String((char*)data).substring(0, len);
-      
+
       if (index + len >= total) {
         yield(); // Даем время другим задачам
-        
+
         StaticJsonDocument<256> doc;
         DeserializationError error = deserializeJson(doc, modeRequestBody);
         
@@ -755,11 +778,16 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка лимита размера запроса
+      if (total > MAX_REQUEST_BODY_SIZE) {
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        return;
+      }
       wifiConnectRequestBody += String((char*)data).substring(0, len);
-      
+
       if (index + len >= total) {
         yield(); // Даем время другим задачам
-        
+
         StaticJsonDocument<256> doc;
         deserializeJson(doc, wifiConnectRequestBody);
         
