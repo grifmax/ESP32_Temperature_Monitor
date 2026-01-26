@@ -15,28 +15,7 @@
 #include "sensors.h"
 #include "display.h"
 #include "buzzer.h"
-
-// Forward declaration для доступа к кешу настроек из main.cpp
-struct SensorConfig {
-  String address;
-  String name;
-  bool enabled;
-  float correction;
-  String mode;
-  bool sendToNetworks;
-  bool buzzerEnabled;
-  float alertMinTemp;
-  float alertMaxTemp;
-  bool alertBuzzerEnabled;
-  float stabTargetTemp;
-  float stabTolerance;
-  float stabAlertThreshold;
-  unsigned long stabDuration;
-  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
-  bool valid;
-};
-extern SensorConfig sensorConfigs[];
-extern int sensorConfigCount;
+#include "sensor_config.h"
 
 extern float currentTemp;
 extern unsigned long deviceUptime;

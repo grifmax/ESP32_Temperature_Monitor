@@ -62,43 +62,16 @@ bool buttonPressed = false;
 int clickCount = 0;
 unsigned long lastClickTime = 0;
 
-// Кеш настроек термометров
-struct SensorConfig {
-  String address;
-  String name;
-  bool enabled;
-  float correction;
-  String mode;
-  bool sendToNetworks;
-  bool buzzerEnabled;
-  float alertMinTemp;
-  float alertMaxTemp;
-  bool alertBuzzerEnabled;
-  float stabTargetTemp;
-  float stabTolerance;
-  float stabAlertThreshold;
-  unsigned long stabDuration;
-  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
-  bool valid;
-};
+// Конфигурация датчиков (структуры определены в sensor_config.h)
+#include "sensor_config.h"
 
-#define MAX_SENSORS 10
+// Глобальные переменные для конфигурации датчиков
 SensorConfig sensorConfigs[MAX_SENSORS];
-int sensorConfigCount = 0;
-unsigned long lastSettingsReload = 0;
-const unsigned long SETTINGS_RELOAD_INTERVAL = 30000; // Перезагружаем настройки каждые 30 секунд
-
-// Состояния для отслеживания отправки
-struct SensorState {
-  float lastSentTemp;
-  unsigned long stabilizationStartTime;
-  bool isStabilized;
-};
 SensorState sensorStates[MAX_SENSORS];
-bool forceReloadSettings = false; // Флаг для принудительной перезагрузки настроек
-
-// Forward declaration
-void loadSensorConfigs();
+int sensorConfigCount = 0;
+bool forceReloadSettings = false;
+unsigned long lastSettingsReload = 0;
+const unsigned long SETTINGS_RELOAD_INTERVAL = 30000;
 
 void setup() {
   Serial.begin(115200);
