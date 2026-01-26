@@ -13,3 +13,9 @@
 
 # Backup files
 *.bak
+
+# Claude AI files
+.claude/
+
+# Windows null device
+nul

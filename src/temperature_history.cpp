@@ -67,59 +67,46 @@ TemperatureRecord* getHistory(int* count) {
 }
 
 TemperatureRecord* getHistoryForPeriod(unsigned long startTime, unsigned long endTime, int* count) {
-  // Используем оригинальный массив истории вместо создания копии для экономии памяти
-  // Подсчитываем количество записей в периоде
-  int filteredCount = 0;
+  // Используем статический массив вместо malloc для избежания проблем с инициализацией String
+  // MAX_HISTORY_SIZE достаточно для всех записей
+  static TemperatureRecord filtered[MAX_HISTORY_SIZE];
+  static bool filteredInitialized = false;
   
-  // Сначала считаем количество записей
-  for (int i = 0; i < historyCount; i++) {
-    int idx = (historyIndex - historyCount + i + MAX_HISTORY_SIZE) % MAX_HISTORY_SIZE;
-    if (history[idx].timestamp >= startTime && history[idx].timestamp <= endTime) {
-      filteredCount++;
+  // Инициализируем массив при первом использовании
+  if (!filteredInitialized) {
+    for (int i = 0; i < MAX_HISTORY_SIZE; i++) {
+      filtered[i].timestamp = 0;
+      filtered[i].temperature = 0.0;
+      filtered[i].sensorAddress = "";
     }
+    filteredInitialized = true;
   }
   
-  *count = filteredCount;
-  
-  // Если записей нет, возвращаем пустой указатель
-  if (filteredCount == 0) {
-    return nullptr;
-  }
-  
-  // Создаем временный массив только нужного размера (экономия памяти)
-  static TemperatureRecord* filtered = nullptr;
-  static int filteredSize = 0;
-  
-  // Перераспределяем память только если нужно больше места
-  if (filteredCount > filteredSize) {
-    if (filtered != nullptr) {
-      free(filtered);
-    }
-    filtered = (TemperatureRecord*)malloc(filteredCount * sizeof(TemperatureRecord));
-    filteredSize = filteredCount;
-    if (filtered == nullptr) {
-      filteredSize = 0;
-      *count = 0;
-      return nullptr;
-    }
-  }
-  
-  // Заполняем массив
+  // Подсчитываем количество записей в периоде и заполняем массив
   int fillIndex = 0;
-  for (int i = 0; i < historyCount && fillIndex < filteredCount; i++) {
+  for (int i = 0; i < historyCount; i++) {
     int idx = (historyIndex - historyCount + i + MAX_HISTORY_SIZE) % MAX_HISTORY_SIZE;
     // Пропускаем записи с нулевыми или невалидными значениями
     if (history[idx].timestamp >= startTime && 
         history[idx].timestamp <= endTime &&
         history[idx].temperature != 0.0 &&
         history[idx].temperature != -127.0) {
-      filtered[fillIndex] = history[idx];
+      // Правильно копируем запись (String будет скопирован корректно)
+      filtered[fillIndex].timestamp = history[idx].timestamp;
+      filtered[fillIndex].temperature = history[idx].temperature;
+      filtered[fillIndex].sensorAddress = history[idx].sensorAddress;
       fillIndex++;
     }
     yield(); // Даем время другим задачам
   }
   
-  *count = fillIndex; // Обновляем реальное количество валидных записей
+  *count = fillIndex;
+  
+  // Если записей нет, возвращаем пустой указатель
+  if (fillIndex == 0) {
+    return nullptr;
+  }
+  
   return filtered;
 }
 

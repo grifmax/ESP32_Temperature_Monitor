@@ -27,7 +27,7 @@ struct SensorConfig {
   float stabTolerance;
   float stabAlertThreshold;
   unsigned long stabDuration;
-  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
+  float monitoringThreshold;  // Уставка изменения температуры для отправки в режиме мониторинга (°C)
   bool valid;
 };
 
