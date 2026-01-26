@@ -35,6 +35,11 @@ function formatTime(date) {
 async function fetchData() {
     try {
         const response = await fetch(API_ENDPOINT);
+        if (response.status === 401) {
+            // Не авторизован - редирект на логин
+            window.location.href = '/login.html';
+            return;
+        }
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }

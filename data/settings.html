@@ -263,6 +263,7 @@
             <button class="tab-button" onclick="showTab('telegram')">💬 Telegram</button>
             <button class="tab-button" onclick="showTab('timezone')">🕐 Часовой пояс</button>
             <button class="tab-button" onclick="showTab('sensors')">🌡️ Термометры</button>
+            <button class="tab-button" onclick="showTab('security')">🔒 Безопасность</button>
         </div>
         
         <!-- Wi-Fi настройки -->
@@ -448,8 +449,42 @@
                 <button type="button" class="btn btn-secondary" onclick="refreshSensors()">🔄 Обновить список</button>
             </div>
         </div>
+
+        <!-- Безопасность -->
+        <div id="security-tab" class="tab-content">
+            <h2>Настройки безопасности</h2>
+            <form id="security-form">
+                <div class="form-group">
+                    <label for="current-password">Текущий пароль</label>
+                    <input type="password" id="current-password" name="currentPassword" placeholder="Введите текущий пароль">
+                </div>
+
+                <div class="form-group">
+                    <label for="new-password">Новый пароль</label>
+                    <input type="password" id="new-password" name="newPassword" placeholder="Введите новый пароль" minlength="4">
+                    <small>Минимум 4 символа</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="confirm-password">Подтвердите пароль</label>
+                    <input type="password" id="confirm-password" name="confirmPassword" placeholder="Повторите новый пароль">
+                </div>
+
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="changePassword()">Изменить пароль</button>
+                </div>
+
+                <hr style="margin: 30px 0; border-color: #eee;">
+
+                <div class="form-group">
+                    <label>Выход из системы</label>
+                    <button type="button" class="btn btn-secondary" onclick="logout()" style="margin-top: 10px;">🚪 Выйти</button>
+                    <small>Завершить текущую сессию</small>
+                </div>
+            </form>
+        </div>
     </div>
-    
+
     <script src="settings.js"></script>
 </body>
 </html>

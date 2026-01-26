@@ -793,6 +793,64 @@ async function updateSensorsTemperature() {
     }
 }
 
+// ===== БЕЗОПАСНОСТЬ =====
+
+// Смена пароля
+async function changePassword() {
+    const currentPass = document.getElementById('current-password').value;
+    const newPass = document.getElementById('new-password').value;
+    const confirmPass = document.getElementById('confirm-password').value;
+
+    if (!currentPass || !newPass || !confirmPass) {
+        showMessage('Заполните все поля', 'error');
+        return;
+    }
+
+    if (newPass !== confirmPass) {
+        showMessage('Новые пароли не совпадают', 'error');
+        return;
+    }
+
+    if (newPass.length < 4) {
+        showMessage('Пароль должен быть минимум 4 символа', 'error');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/auth/password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                currentPassword: currentPass,
+                newPassword: newPass
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            showMessage('Пароль успешно изменён', 'success');
+            document.getElementById('current-password').value = '';
+            document.getElementById('new-password').value = '';
+            document.getElementById('confirm-password').value = '';
+        } else {
+            showMessage(data.error || 'Ошибка смены пароля', 'error');
+        }
+    } catch (e) {
+        showMessage('Ошибка подключения', 'error');
+    }
+}
+
+// Выход из системы
+async function logout() {
+    try {
+        await fetch('/api/auth/logout', { method: 'POST' });
+        window.location.href = '/login.html';
+    } catch (e) {
+        window.location.href = '/login.html';
+    }
+}
+
 // Загрузить настройки при загрузке страницы
 document.addEventListener('DOMContentLoaded', () => {
     loadSettings();

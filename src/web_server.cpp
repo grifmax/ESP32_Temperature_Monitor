@@ -54,37 +54,263 @@ String pendingNvsData = "";
 #define PREF_MQTT_TOPIC_CT "mqtt_topic_ct"
 #define PREF_MQTT_SEC "mqtt_sec"
 
+// ===== АВТОРИЗАЦИЯ =====
+#define PREF_AUTH_PASS "auth_pass"
+#define DEFAULT_USERNAME "admin"
+#define DEFAULT_PASSWORD "admin"
+#define SESSION_COOKIE_NAME "esp32_session"
+
+// Текущий активный токен сессии (простая реализация - один токен на устройство)
+String activeSessionToken = "";
+unsigned long sessionExpireTime = 0;
+
+// Генерация случайного токена сессии
+String generateSessionToken() {
+  String token = "";
+  const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  for (int i = 0; i < 32; i++) {
+    token += charset[random(0, sizeof(charset) - 1)];
+  }
+  return token;
+}
+
+// Получение пароля из NVS (или дефолтный)
+String getAuthPassword() {
+  if (!preferences.begin(PREF_NAMESPACE, true)) {
+    return DEFAULT_PASSWORD;
+  }
+  String pass = preferences.getString(PREF_AUTH_PASS, DEFAULT_PASSWORD);
+  preferences.end();
+  return pass;
+}
+
+// Сохранение пароля в NVS
+bool setAuthPassword(const String& newPassword) {
+  if (!preferences.begin(PREF_NAMESPACE, false)) {
+    return false;
+  }
+  preferences.putString(PREF_AUTH_PASS, newPassword);
+  preferences.end();
+  return true;
+}
+
+// Проверка авторизации по cookie
+bool isAuthenticated(AsyncWebServerRequest *request) {
+  // Проверяем cookie
+  if (request->hasHeader("Cookie")) {
+    String cookie = request->header("Cookie");
+    String tokenKey = String(SESSION_COOKIE_NAME) + "=";
+    int tokenStart = cookie.indexOf(tokenKey);
+    if (tokenStart >= 0) {
+      tokenStart += tokenKey.length();
+      int tokenEnd = cookie.indexOf(";", tokenStart);
+      String token = (tokenEnd > 0) ? cookie.substring(tokenStart, tokenEnd) : cookie.substring(tokenStart);
+      token.trim();
+
+      // Проверяем токен и срок действия
+      if (token.length() > 0 && token == activeSessionToken) {
+        if (sessionExpireTime == 0 || millis() < sessionExpireTime) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Редирект на страницу логина
+void redirectToLogin(AsyncWebServerRequest *request) {
+  request->redirect("/login.html");
+}
+
+// Проверка авторизации и редирект если не авторизован
+bool checkAuthOrRedirect(AsyncWebServerRequest *request) {
+  if (!isAuthenticated(request)) {
+    redirectToLogin(request);
+    return false;
+  }
+  return true;
+}
+
+// Проверка авторизации для API (возвращает 401)
+bool checkAuthOrUnauthorized(AsyncWebServerRequest *request) {
+  if (!isAuthenticated(request)) {
+    request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return false;
+  }
+  return true;
+}
+
 void startWebServer() {
+  // ===== СТРАНИЦА ЛОГИНА (публичная) =====
+  server.on("/login.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(SPIFFS, "/login.html", "text/html");
+  });
+
+  // ===== AUTH API (публичные) =====
+  // Проверка статуса авторизации
+  server.on("/api/auth/check", HTTP_GET, [](AsyncWebServerRequest *request){
+    StaticJsonDocument<128> doc;
+    doc["authenticated"] = isAuthenticated(request);
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // Вход в систему
+  static String loginRequestBody = "";
+  server.on("/api/auth/login", HTTP_POST,
+    [](AsyncWebServerRequest *request){},
+    NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      if (total > 1024) {
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        return;
+      }
+      loginRequestBody += String((char*)data).substring(0, len);
+
+      if (index + len >= total) {
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, loginRequestBody);
+        loginRequestBody = "";
+
+        if (error) {
+          request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+          return;
+        }
+
+        String username = doc["username"] | "";
+        String password = doc["password"] | "";
+        bool remember = doc["remember"] | false;
+
+        // Проверяем логин и пароль
+        String storedPassword = getAuthPassword();
+        if (username == DEFAULT_USERNAME && password == storedPassword) {
+          // Генерируем токен сессии
+          activeSessionToken = generateSessionToken();
+
+          // Устанавливаем срок действия
+          if (remember) {
+            sessionExpireTime = 0; // Бессрочно (до перезагрузки)
+          } else {
+            sessionExpireTime = millis() + (24UL * 60 * 60 * 1000); // 24 часа
+          }
+
+          // Формируем cookie
+          String cookie = String(SESSION_COOKIE_NAME) + "=" + activeSessionToken + "; Path=/";
+          if (remember) {
+            cookie += "; Max-Age=2592000"; // 30 дней
+          }
+          cookie += "; HttpOnly; SameSite=Strict";
+
+          AsyncWebServerResponse *response = request->beginResponse(200, "application/json", "{\"status\":\"ok\"}");
+          response->addHeader("Set-Cookie", cookie);
+          request->send(response);
+        } else {
+          request->send(401, "application/json", "{\"error\":\"Invalid credentials\"}");
+        }
+      }
+    });
+
+  // Выход из системы
+  server.on("/api/auth/logout", HTTP_POST, [](AsyncWebServerRequest *request){
+    activeSessionToken = "";
+    sessionExpireTime = 0;
+    String cookie = String(SESSION_COOKIE_NAME) + "=; Path=/; Max-Age=0";
+    AsyncWebServerResponse *response = request->beginResponse(200, "application/json", "{\"status\":\"ok\"}");
+    response->addHeader("Set-Cookie", cookie);
+    request->send(response);
+  });
+
+  // Смена пароля (требует авторизации)
+  static String passwordRequestBody = "";
+  server.on("/api/auth/password", HTTP_POST,
+    [](AsyncWebServerRequest *request){},
+    NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      if (!isAuthenticated(request)) {
+        request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+      }
+      if (total > 512) {
+        request->send(413, "application/json", "{\"error\":\"Request too large\"}");
+        return;
+      }
+      passwordRequestBody += String((char*)data).substring(0, len);
+
+      if (index + len >= total) {
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, passwordRequestBody);
+        passwordRequestBody = "";
+
+        if (error) {
+          request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+          return;
+        }
+
+        String currentPass = doc["currentPassword"] | "";
+        String newPass = doc["newPassword"] | "";
+
+        if (newPass.length() < 4) {
+          request->send(400, "application/json", "{\"error\":\"Password too short (min 4 chars)\"}");
+          return;
+        }
+
+        String storedPassword = getAuthPassword();
+        if (currentPass != storedPassword) {
+          request->send(401, "application/json", "{\"error\":\"Current password incorrect\"}");
+          return;
+        }
+
+        if (setAuthPassword(newPass)) {
+          request->send(200, "application/json", "{\"status\":\"ok\"}");
+        } else {
+          request->send(500, "application/json", "{\"error\":\"Failed to save password\"}");
+        }
+      }
+    });
+
+  // ===== ЗАЩИЩЁННЫЕ СТРАНИЦЫ =====
   // Главная страница
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrRedirect(request)) return;
     request->send(SPIFFS, "/index.html", "text/html");
   });
-  
-  // Статические файлы (без gzip)
+
+  // Статические файлы (защищённые)
   server.on("/index.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrRedirect(request)) return;
     request->send(SPIFFS, "/index.html", "text/html");
   });
   server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request){
+    // CSS публичный (нужен для страницы логина)
     request->send(SPIFFS, "/style.css", "text/css");
   });
   server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrRedirect(request)) return;
     request->send(SPIFFS, "/script.js", "application/javascript");
   });
   server.on("/settings.html", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrRedirect(request)) return;
     request->send(SPIFFS, "/settings.html", "text/html");
   });
   server.on("/settings.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrRedirect(request)) return;
     request->send(SPIFFS, "/settings.js", "application/javascript");
   });
   server.on("/chart.min.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrRedirect(request)) return;
     request->send(SPIFFS, "/chart.min.js", "application/javascript");
   });
   server.on("/chartjs-plugin-zoom.min.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrRedirect(request)) return;
     request->send(SPIFFS, "/chartjs-plugin-zoom.min.js", "application/javascript");
   });
 
   // JSON API endpoint для получения данных
+  // ===== ЗАЩИЩЁННЫЕ API =====
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     // Увеличено для поддержки данных о термометрах
     StaticJsonDocument<2048> doc;
     
@@ -294,6 +520,7 @@ void startWebServer() {
   
   // API для получения истории температуры
   server.on("/api/temperature/history", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     String period = request->getParam("period") ? request->getParam("period")->value() : "24h";
     
     unsigned long endTime = getUnixTime();
@@ -357,6 +584,7 @@ void startWebServer() {
   
   // API для запуска сканирования Wi-Fi сетей (асинхронное)
   server.on("/api/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     Serial.println(F("WiFi scan requested..."));
 
     // Убеждаемся, что WiFi в режиме, позволяющем сканировать
@@ -416,6 +644,7 @@ void startWebServer() {
   
   // API для получения текущих настроек
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     String settings = getSettings();
     request->send(200, "application/json", settings);
   });
@@ -429,6 +658,11 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка авторизации
+      if (!isAuthenticated(request)) {
+        request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+      }
       // Проверка лимита размера запроса
       if (total > MAX_REQUEST_BODY_SIZE) {
         request->send(413, "application/json", "{\"error\":\"Request too large\"}");
@@ -454,6 +688,7 @@ void startWebServer() {
   
   // API для получения списка термометров
   server.on("/api/sensors", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     StaticJsonDocument<4096> doc;
     JsonArray sensorsArray = doc.createNestedArray("sensors");
     
@@ -574,6 +809,11 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка авторизации
+      if (!isAuthenticated(request)) {
+        request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+      }
       // Проверка лимита размера запроса
       if (total > MAX_REQUEST_BODY_SIZE) {
         request->send(413, "application/json", "{\"error\":\"Request too large\"}");
@@ -645,9 +885,10 @@ void startWebServer() {
   
   // API для получения настроек конкретного термометра
   server.on("^/api/sensor/([0-9]+)$", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     String sensorId = request->pathArg(0);
     int id = sensorId.toInt();
-    
+
     StaticJsonDocument<384> doc;
     doc["id"] = id;
     doc["name"] = "Термометр " + sensorId;
@@ -677,6 +918,11 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка авторизации
+      if (!isAuthenticated(request)) {
+        request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+      }
       // Проверка лимита размера запроса
       if (total > MAX_REQUEST_BODY_SIZE) {
         request->send(413, "application/json", "{\"error\":\"Request too large\"}");
@@ -704,6 +950,7 @@ void startWebServer() {
   
   // API для получения режима работы
   server.on("/api/mode", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     StaticJsonDocument<256> doc;
     OperationMode mode = getOperationMode();
     doc["mode"] = mode;
@@ -734,6 +981,11 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка авторизации
+      if (!isAuthenticated(request)) {
+        request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+      }
       // Проверка лимита размера запроса
       if (total > MAX_REQUEST_BODY_SIZE) {
         request->send(413, "application/json", "{\"error\":\"Request too large\"}");
@@ -784,6 +1036,11 @@ void startWebServer() {
     }, 
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      // Проверка авторизации
+      if (!isAuthenticated(request)) {
+        request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+        return;
+      }
       // Проверка лимита размера запроса
       if (total > MAX_REQUEST_BODY_SIZE) {
         request->send(413, "application/json", "{\"error\":\"Request too large\"}");
@@ -817,8 +1074,9 @@ void startWebServer() {
   
   // API для отправки тестового сообщения в Telegram
   server.on("/api/telegram/test", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     yield(); // Даем время другим задачам
-    
+
     // Проверяем подключение WiFi
     if (WiFi.status() != WL_CONNECTED) {
       request->send(500, "application/json", "{\"status\":\"error\",\"message\":\"WiFi not connected\"}");
@@ -838,6 +1096,7 @@ void startWebServer() {
   
   // API для отправки тестового сообщения в MQTT
   server.on("/api/mqtt/test", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     yield();
     bool success = sendMqttTestMessage();
     if (success) {
@@ -849,6 +1108,7 @@ void startWebServer() {
   
   // API для принудительного отключения MQTT
   server.on("/api/mqtt/disable", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     yield();
     disableMqtt();
     request->send(200, "application/json", "{\"status\":\"ok\",\"message\":\"MQTT disabled\"}");
@@ -856,6 +1116,7 @@ void startWebServer() {
 
   // API для отладочной информации (память, задачи, версия)
   server.on("/api/debug", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!checkAuthOrUnauthorized(request)) return;
     StaticJsonDocument<512> doc;
 
     // Информация о памяти
