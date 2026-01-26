@@ -177,9 +177,10 @@ void startWebServer() {
     if (mode == MODE_STABILIZATION) {
       doc["stabilization"]["is_stabilized"] = isStabilized();
       doc["stabilization"]["time"] = getStabilizationTime();
+      doc["stabilization"]["stabilized_temp"] = getStabilizedTemp();
       StabilizationModeSettings stab = getStabilizationSettings();
-      doc["stabilization"]["target_temp"] = stab.targetTemp;
       doc["stabilization"]["tolerance"] = stab.tolerance;
+      doc["stabilization"]["alert_threshold"] = stab.alertThreshold;
     }
     
     // Добавляем информацию о термометрах (автоматическое обнаружение)
@@ -276,7 +277,6 @@ void startWebServer() {
           if (saved.containsKey("stabilizationSettings")) {
             sensor["stabilizationSettings"] = saved["stabilizationSettings"];
           } else {
-            sensor["stabilizationSettings"]["targetTemp"] = 25.0;
             sensor["stabilizationSettings"]["tolerance"] = 0.1;
             sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
             sensor["stabilizationSettings"]["duration"] = 10;
@@ -293,7 +293,6 @@ void startWebServer() {
           sensor["alertSettings"]["minTemp"] = 10.0;
           sensor["alertSettings"]["maxTemp"] = 30.0;
           sensor["alertSettings"]["buzzerEnabled"] = true;
-          sensor["stabilizationSettings"]["targetTemp"] = 25.0;
           sensor["stabilizationSettings"]["tolerance"] = 0.1;
           sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
           sensor["stabilizationSettings"]["duration"] = 10;
@@ -692,7 +691,6 @@ void startWebServer() {
           if (saved.containsKey("stabilizationSettings")) {
             sensor["stabilizationSettings"] = saved["stabilizationSettings"];
           } else {
-            sensor["stabilizationSettings"]["targetTemp"] = 25.0;
             sensor["stabilizationSettings"]["tolerance"] = 0.1;
             sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
             sensor["stabilizationSettings"]["duration"] = 10;
@@ -709,7 +707,6 @@ void startWebServer() {
           sensor["alertSettings"]["minTemp"] = 10.0;
           sensor["alertSettings"]["maxTemp"] = 30.0;
           sensor["alertSettings"]["buzzerEnabled"] = true;
-          sensor["stabilizationSettings"]["targetTemp"] = 25.0;
           sensor["stabilizationSettings"]["tolerance"] = 0.1;
           sensor["stabilizationSettings"]["alertThreshold"] = 0.2;
           sensor["stabilizationSettings"]["duration"] = 10;
@@ -848,7 +845,6 @@ void startWebServer() {
     doc["alertSettings"]["minTemp"] = 10.0;
     doc["alertSettings"]["maxTemp"] = 30.0;
     doc["alertSettings"]["buzzerEnabled"] = true;
-    doc["stabilizationSettings"]["targetTemp"] = 25.0;
     doc["stabilizationSettings"]["tolerance"] = 0.1;
     doc["stabilizationSettings"]["alertThreshold"] = 0.2;
     doc["stabilizationSettings"]["duration"] = 10;
@@ -899,10 +895,11 @@ void startWebServer() {
       doc["alert"]["buzzer_enabled"] = alert.buzzerEnabled;
     } else if (mode == MODE_STABILIZATION) {
       StabilizationModeSettings stab = getStabilizationSettings();
-      doc["stabilization"]["target_temp"] = stab.targetTemp;
       doc["stabilization"]["tolerance"] = stab.tolerance;
       doc["stabilization"]["alert_threshold"] = stab.alertThreshold;
       doc["stabilization"]["duration"] = stab.duration;
+      doc["stabilization"]["is_stabilized"] = isStabilized();
+      doc["stabilization"]["stabilized_temp"] = getStabilizedTemp();
     }
     
     String response;
@@ -938,11 +935,10 @@ void startWebServer() {
             setAlertSettings(minTemp, maxTemp, buzzerEnabled);
             yield();
           } else if (mode == MODE_STABILIZATION && doc.containsKey("stabilization")) {
-            float targetTemp = doc["stabilization"]["target_temp"] | 25.0;
             float tolerance = doc["stabilization"]["tolerance"] | 0.1;
             float alertThreshold = doc["stabilization"]["alert_threshold"] | 0.2;
             unsigned long duration = doc["stabilization"]["duration"] | 600;
-            setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+            setStabilizationSettings(tolerance, alertThreshold, duration);
             yield();
           }
           
@@ -1741,11 +1737,10 @@ void applySettingsFromJson(StaticJsonDocument<8192>& mergedDoc) {
   }
   
   if (mergedDoc.containsKey("stabilization")) {
-    float targetTemp = mergedDoc["stabilization"]["target_temp"] | 25.0;
     float tolerance = mergedDoc["stabilization"]["tolerance"] | 0.1;
     float alertThreshold = mergedDoc["stabilization"]["alert_threshold"] | 0.2;
     unsigned long duration = mergedDoc["stabilization"]["duration"] | 600;
-    setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+    setStabilizationSettings(tolerance, alertThreshold, duration);
     yield();
     delay(10);
     yield();

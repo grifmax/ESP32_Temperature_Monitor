@@ -14,31 +14,39 @@ AlertModeSettings alertSettings = {
 
 // Настройки режима стабилизации
 StabilizationModeSettings stabilizationSettings = {
-  .targetTemp = 25.0,
   .tolerance = 0.1,
   .alertThreshold = 0.2,
   .duration = 600  // 10 минут
 };
 
-// Состояние стабилизации
+// Состояние стабилизации (новая логика - отслеживание колебаний)
 struct StabilizationState {
-  bool isStabilized;
-  unsigned long stabilizationStartTime;
-  float lastTemp;
-  unsigned long lastChangeTime;
+  bool isStabilized;                    // Достигнута ли стабилизация
+  unsigned long trackingStartTime;      // Начало периода отслеживания
+  float minTempInPeriod;                // Минимальная температура за период
+  float maxTempInPeriod;                // Максимальная температура за период
+  float stabilizedTemp;                 // Температура стабилизации (среднее при достижении)
+  float lastTemp;                       // Последняя измеренная температура
+  unsigned long lastUpdateTime;         // Время последнего обновления
 } stabilizationState = {
   .isStabilized = false,
-  .stabilizationStartTime = 0,
+  .trackingStartTime = 0,
+  .minTempInPeriod = 999.0,
+  .maxTempInPeriod = -999.0,
+  .stabilizedTemp = 0.0,
   .lastTemp = 0.0,
-  .lastChangeTime = 0
+  .lastUpdateTime = 0
 };
 
 void initOperationModes() {
   currentMode = MODE_LOCAL;
   stabilizationState.isStabilized = false;
-  stabilizationState.stabilizationStartTime = 0;
+  stabilizationState.trackingStartTime = 0;
+  stabilizationState.minTempInPeriod = 999.0;
+  stabilizationState.maxTempInPeriod = -999.0;
+  stabilizationState.stabilizedTemp = 0.0;
   stabilizationState.lastTemp = 0.0;
-  stabilizationState.lastChangeTime = 0;
+  stabilizationState.lastUpdateTime = 0;
 }
 
 void setOperationMode(OperationMode mode) {
@@ -46,7 +54,10 @@ void setOperationMode(OperationMode mode) {
   // Сброс состояния стабилизации при смене режима
   if (mode != MODE_STABILIZATION) {
     stabilizationState.isStabilized = false;
-    stabilizationState.stabilizationStartTime = 0;
+    stabilizationState.trackingStartTime = 0;
+    stabilizationState.minTempInPeriod = 999.0;
+    stabilizationState.maxTempInPeriod = -999.0;
+    stabilizationState.stabilizedTemp = 0.0;
   }
 }
 
@@ -64,8 +75,7 @@ AlertModeSettings getAlertSettings() {
   return alertSettings;
 }
 
-void setStabilizationSettings(float targetTemp, float tolerance, float alertThreshold, unsigned long duration) {
-  stabilizationSettings.targetTemp = targetTemp;
+void setStabilizationSettings(float tolerance, float alertThreshold, unsigned long duration) {
   stabilizationSettings.tolerance = tolerance;
   stabilizationSettings.alertThreshold = alertThreshold;
   stabilizationSettings.duration = duration;
@@ -81,54 +91,109 @@ void updateOperationMode() {
 }
 
 // Функция проверки стабилизации (вызывается извне)
+// Новая логика: отслеживание колебаний температуры за период duration
+// Возвращает true когда температура только что стабилизировалась (один раз)
 bool checkStabilization(float currentTemp) {
   if (currentMode != MODE_STABILIZATION) {
     return false;
   }
-  
-  float diff = abs(currentTemp - stabilizationSettings.targetTemp);
-  
-  // Проверка на попадание в допуск
-  if (diff <= stabilizationSettings.tolerance) {
-    if (!stabilizationState.isStabilized) {
-      // Только что стабилизировались
+
+  unsigned long now = millis();
+  stabilizationState.lastTemp = currentTemp;
+  stabilizationState.lastUpdateTime = now;
+
+  // Если уже стабилизировано - не возвращаем true повторно
+  // (тревога обрабатывается в checkStabilizationAlert)
+  if (stabilizationState.isStabilized) {
+    return false;
+  }
+
+  // Фаза отслеживания (tracking)
+  // Инициализация периода отслеживания
+  if (stabilizationState.trackingStartTime == 0) {
+    stabilizationState.trackingStartTime = now;
+    stabilizationState.minTempInPeriod = currentTemp;
+    stabilizationState.maxTempInPeriod = currentTemp;
+    return false;
+  }
+
+  // Обновляем min/max за период
+  if (currentTemp < stabilizationState.minTempInPeriod) {
+    stabilizationState.minTempInPeriod = currentTemp;
+  }
+  if (currentTemp > stabilizationState.maxTempInPeriod) {
+    stabilizationState.maxTempInPeriod = currentTemp;
+  }
+
+  // Вычисляем размах колебаний
+  float tempRange = stabilizationState.maxTempInPeriod - stabilizationState.minTempInPeriod;
+
+  // Проверяем, прошло ли достаточно времени для определения стабильности
+  unsigned long elapsedTime = now - stabilizationState.trackingStartTime;
+  unsigned long requiredTime = stabilizationSettings.duration * 1000;
+
+  if (elapsedTime >= requiredTime) {
+    // Время прошло - проверяем колебания
+    // Колебания должны быть в пределах ±tolerance (т.е. размах <= tolerance * 2)
+    if (tempRange <= stabilizationSettings.tolerance * 2) {
+      // Стабилизация достигнута!
       stabilizationState.isStabilized = true;
-      stabilizationState.stabilizationStartTime = millis();
-      stabilizationState.lastTemp = currentTemp;
-      stabilizationState.lastChangeTime = millis();
+      // Запоминаем среднюю температуру как стабильную
+      stabilizationState.stabilizedTemp = (stabilizationState.minTempInPeriod + stabilizationState.maxTempInPeriod) / 2.0;
+
+      Serial.print(F("Stabilization reached! Temp: "));
+      Serial.print(stabilizationState.stabilizedTemp);
+      Serial.print(F("°C, range: ±"));
+      Serial.print(tempRange / 2.0);
+      Serial.println(F("°C"));
+
+      return true; // Сигнал о достижении стабилизации (один раз)
     } else {
-      // Проверяем, что температура не меняется значительно
-      if (abs(currentTemp - stabilizationState.lastTemp) > stabilizationSettings.tolerance) {
-        // Температура вышла за допуск
-        stabilizationState.isStabilized = false;
-        stabilizationState.stabilizationStartTime = 0;
-      }
-      stabilizationState.lastTemp = currentTemp;
-      stabilizationState.lastChangeTime = millis();
+      // Колебания слишком большие - сбрасываем период и начинаем заново
+      stabilizationState.trackingStartTime = now;
+      stabilizationState.minTempInPeriod = currentTemp;
+      stabilizationState.maxTempInPeriod = currentTemp;
     }
-  } else {
-    // Не в допуске
-    stabilizationState.isStabilized = false;
-    stabilizationState.stabilizationStartTime = 0;
   }
-  
-  // Проверка времени работы на уставке
-  if (stabilizationState.isStabilized && 
-      (millis() - stabilizationState.stabilizationStartTime) >= (stabilizationSettings.duration * 1000)) {
-    return true; // Стабилизация завершена успешно
-  }
-  
+
   return false;
 }
 
 // Функция проверки превышения порога тревоги в режиме стабилизации
+// Возвращает true если температура отклонилась от стабильной более чем на alertThreshold
+// При срабатывании тревоги сбрасывает состояние стабилизации и возвращает в режим отслеживания
 bool checkStabilizationAlert(float currentTemp) {
   if (currentMode != MODE_STABILIZATION) {
     return false;
   }
-  
-  float diff = abs(currentTemp - stabilizationSettings.targetTemp);
-  return diff > stabilizationSettings.alertThreshold;
+
+  // Тревога только если уже была достигнута стабилизация
+  if (!stabilizationState.isStabilized) {
+    return false;
+  }
+
+  float diff = abs(currentTemp - stabilizationState.stabilizedTemp);
+
+  if (diff > stabilizationSettings.alertThreshold) {
+    // Температура отклонилась - тревога!
+    Serial.print(F("Stabilization alert! Current: "));
+    Serial.print(currentTemp);
+    Serial.print(F("°C, stabilized: "));
+    Serial.print(stabilizationState.stabilizedTemp);
+    Serial.print(F("°C, diff: "));
+    Serial.print(diff);
+    Serial.println(F("°C"));
+
+    // Сбрасываем состояние - возвращаемся в режим отслеживания
+    stabilizationState.isStabilized = false;
+    stabilizationState.trackingStartTime = millis();
+    stabilizationState.minTempInPeriod = currentTemp;
+    stabilizationState.maxTempInPeriod = currentTemp;
+
+    return true;
+  }
+
+  return false;
 }
 
 // Получение состояния стабилизации
@@ -136,9 +201,14 @@ bool isStabilized() {
   return stabilizationState.isStabilized;
 }
 
+// Получить температуру стабилизации
+float getStabilizedTemp() {
+  return stabilizationState.stabilizedTemp;
+}
+
 unsigned long getStabilizationTime() {
-  if (stabilizationState.isStabilized) {
-    return (millis() - stabilizationState.stabilizationStartTime) / 1000;
+  if (stabilizationState.trackingStartTime > 0) {
+    return (millis() - stabilizationState.trackingStartTime) / 1000;
   }
   return 0;
 }

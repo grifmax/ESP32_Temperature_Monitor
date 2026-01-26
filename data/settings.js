@@ -415,7 +415,6 @@ async function saveSettings(section) {
                         buzzerEnabled: true
                     },
                     stabilizationSettings: s.stabilizationSettings || {
-                        targetTemp: 25.0,
                         tolerance: 0.1,
                         alertThreshold: 0.2,
                         duration: 10
@@ -608,7 +607,6 @@ async function loadSensors() {
                     buzzerEnabled: true
                 },
                 stabilizationSettings: {
-                    targetTemp: 25.0,
                     tolerance: 0.1,
                     alertThreshold: 0.2,
                     duration: 10
@@ -633,7 +631,6 @@ async function loadSensors() {
                 buzzerEnabled: true
             },
             stabilizationSettings: {
-                targetTemp: 25.0,
                 tolerance: 0.1,
                 alertThreshold: 0.2,
                 duration: 10

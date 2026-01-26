@@ -17,11 +17,11 @@ struct AlertModeSettings {
 };
 
 // Структура настроек режима стабилизации
+// Новая логика: отслеживание колебаний температуры, а не конкретной целевой температуры
 struct StabilizationModeSettings {
-  float targetTemp;        // Целевая температура (уставка)
-  float tolerance;         // Допуск стабильности (по умолчанию 0.1°C)
-  float alertThreshold;    // Порог тревоги (по умолчанию 0.2°C)
-  unsigned long duration; // Время работы на уставке в секундах (по умолчанию 600 = 10 минут)
+  float tolerance;         // Допуск стабильности - колебания в пределах ±tolerance (по умолчанию 0.1°C)
+  float alertThreshold;    // Порог тревоги после стабилизации (по умолчанию 0.2°C)
+  unsigned long duration;  // Время наблюдения для определения стабилизации в секундах (по умолчанию 600 = 10 минут)
 };
 
 // Функции управления режимами
@@ -35,8 +35,9 @@ void setAlertSettings(float minTemp, float maxTemp, bool buzzerEnabled);
 AlertModeSettings getAlertSettings();
 
 // Функции для режима стабилизации
-void setStabilizationSettings(float targetTemp, float tolerance, float alertThreshold, unsigned long duration);
+void setStabilizationSettings(float tolerance, float alertThreshold, unsigned long duration);
 StabilizationModeSettings getStabilizationSettings();
+float getStabilizedTemp();  // Получить температуру стабилизации (после достижения стабильности)
 
 // Вспомогательные функции стабилизации
 bool checkStabilization(float currentTemp);

@@ -32,7 +32,7 @@ struct SensorConfig {
   float stabTolerance;
   float stabAlertThreshold;
   unsigned long stabDuration;
-  unsigned long monitoringInterval;  // Интервал отправки в режиме мониторинга (секунды)
+  float monitoringThreshold;  // Уставка изменения температуры для отправки в режиме мониторинга (°C)
   bool valid;
 };
 extern SensorConfig sensorConfigs[];
@@ -68,9 +68,13 @@ bool telegramSendInProgress = false;
 unsigned long lastTelegramSendAttempt = 0;
 unsigned long lastTelegramSendSuccess = 0;
 const unsigned long TELEGRAM_SEND_INTERVAL = 2000; // Минимум 2 секунды между отправками
-const unsigned long TELEGRAM_SEND_TIMEOUT = 5000; // Таймаут отправки 5 секунд
+const unsigned long TELEGRAM_SEND_TIMEOUT = 8000; // Таймаут отправки 8 секунд (увеличено для медленных соединений)
 int telegramConsecutiveFailures = 0;
 const int MAX_TELEGRAM_FAILURES = 3; // После 3 неудач подряд - пауза
+
+// FreeRTOS task handle для Telegram polling
+TaskHandle_t telegramTaskHandle = NULL;
+volatile bool telegramTaskRunning = false;
 
 static void updateTelegramFlags() {
   telegramConfigured = telegramBotToken.length() > 0;
@@ -86,18 +90,26 @@ void ensureTelegramBot() {
       bot = nullptr;
     }
     telegramActiveToken = "";
-    Serial.println(F("Telegram: Bot not configured"));
-    return;
+    return; // Убрали лишнее логирование
   }
   if (!bot || telegramActiveToken != telegramBotToken) {
     if (bot) {
       delete bot;
+      bot = nullptr;
     }
-    bot = new UniversalTelegramBot(telegramBotToken, secured_client);
-    telegramActiveToken = telegramBotToken;
-    Serial.println(F("Telegram: Bot initialized"));
+    // Создаем бота только если WiFi подключен, чтобы не блокировать систему
+    if (WiFi.status() == WL_CONNECTED) {
+      bot = new UniversalTelegramBot(telegramBotToken, secured_client);
+      telegramActiveToken = telegramBotToken;
+      telegramInitialized = true;
+      Serial.println(F("Telegram: Bot initialized"));
+    } else {
+      // WiFi не подключен - не создаем бота, чтобы не блокировать
+      telegramInitialized = false;
+    }
+  } else {
+    telegramInitialized = true;
   }
-  telegramInitialized = true;
 }
 
 // Инициализация очереди Telegram сообщений
@@ -254,8 +266,21 @@ void processTelegramQueue() {
       return;
     }
     
-    // Пытаемся отправить с обработкой ошибок DNS
-    // Проверяем WiFi еще раз перед отправкой
+    // Убеждаемся, что WiFi не отключится во время операции
+    // Сохраняем состояние WiFi перед операцией
+    bool wifiWasConnected = (WiFi.status() == WL_CONNECTED);
+    IPAddress savedIP = WiFi.localIP();
+    
+    // Пересоздаем SSL клиент при необходимости для сброса состояния
+    // Это помогает при проблемах с "висящими" SSL соединениями
+    static unsigned long lastClientReset = 0;
+    if (millis() - lastClientReset > 60000) { // Раз в минуту
+      secured_client.stop();
+      yield();
+      lastClientReset = millis();
+    }
+    
+    // Убеждаемся, что WiFi все еще подключен перед отправкой
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram: WiFi disconnected before send, skipping"));
       delete msg;
@@ -264,12 +289,32 @@ void processTelegramQueue() {
       return;
     }
     
+    // Пытаемся отправить сообщение
+    // sendMessage может занять много времени при проблемах с SSL
     bool success = bot->sendMessage(msg->chatId, msg->message, parseMode);
     
-    // Проверяем, не отключился ли WiFi после отправки
+    // Проверяем WiFi после отправки
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram: WiFi disconnected after send attempt"));
       success = false;
+      // Если WiFi отключился, пытаемся переподключиться
+      if (wifiWasConnected && savedIP != IPAddress(0, 0, 0, 0)) {
+        Serial.println(F("Telegram: Attempting WiFi reconnect"));
+        WiFi.disconnect();
+        yield();
+        WiFi.begin(); // Пытаемся переподключиться к последней сети
+        // Даем время на переподключение
+        for (int i = 0; i < 10 && WiFi.status() != WL_CONNECTED; i++) {
+          delay(500);
+          yield();
+        }
+      }
+    } else if (!success) {
+      // Если отправка не удалась, но WiFi подключен, возможно проблема с SSL
+      Serial.println(F("Telegram: Send failed but WiFi connected, possible SSL issue"));
+      // Пересоздаем SSL клиент для следующей попытки
+      secured_client.stop();
+      yield();
     }
     
     unsigned long sendDuration = millis() - sendStart;
@@ -341,15 +386,68 @@ void processTelegramQueue() {
   }
 }
 
+// FreeRTOS задача для обработки Telegram сообщений
+// Работает в фоне, не блокирует основной loop()
+void telegramTask(void* parameter) {
+  Serial.println(F("Telegram task started"));
+  telegramTaskRunning = true;
+
+  while (true) {
+    // Ждём 5 секунд между проверками
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Проверяем, что WiFi подключен
+    if (WiFi.status() != WL_CONNECTED) {
+      telegramLastPollOk = false;
+      continue;
+    }
+
+    // Дополнительная проверка стабильности WiFi
+    if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+      telegramLastPollOk = false;
+      continue;
+    }
+
+    // Обрабатываем входящие сообщения
+    handleTelegramMessages();
+
+    // Сбрасываем WDT для этой задачи
+    vTaskDelay(pdMS_TO_TICKS(10)); // Короткая пауза для yield
+
+    // Обрабатываем очередь исходящих сообщений
+    processTelegramQueue();
+  }
+
+  telegramTaskRunning = false;
+  vTaskDelete(NULL);
+}
+
 void startTelegramBot() {
   // Настройка SSL для Telegram
   // Для ESP32 можно использовать setInsecure() для тестирования
   // В продакшене следует использовать setCACert() с правильным сертификатом
   secured_client.setInsecure(); // Используется для тестирования
   // Устанавливаем таймауты для предотвращения зависаний
-  secured_client.setTimeout(5); // 5 секунд таймаут для подключения
+  // Увеличиваем таймауты для стабильности при медленных соединениях
+  secured_client.setTimeout(15); // 15 секунд таймаут для подключения и операций
   ensureTelegramBot();
   initTelegramQueue(); // Инициализируем очередь
+
+  // Создаём FreeRTOS задачу для Telegram polling
+  // Запускаем на ядре 0 (Protocol CPU), чтобы не блокировать основной loop на ядре 1
+  if (telegramTaskHandle == NULL) {
+    xTaskCreatePinnedToCore(
+      telegramTask,         // Функция задачи
+      "TelegramTask",       // Имя задачи
+      8192,                 // Размер стека (8KB для SSL/HTTPS)
+      NULL,                 // Параметр
+      1,                    // Приоритет (низкий)
+      &telegramTaskHandle,  // Хэндл задачи
+      0                     // Ядро 0
+    );
+    Serial.println(F("Telegram task created on core 0"));
+  }
+
   if (telegramConfigured) {
     Serial.println(F("Telegram bot initialized"));
   } else {
@@ -628,10 +726,14 @@ void handleTelegramMessages() {
       } else if (mode == MODE_STABILIZATION) {
         StabilizationModeSettings stab = getStabilizationSettings();
         message += "🎯 *Настройки стабилизации:*\n";
-        message += "   Целевая: " + String(stab.targetTemp, 1) + "°C\n";
-        message += "   Допуск: " + String(stab.tolerance, 2) + "°C\n";
+        message += "   Допуск колебаний: ±" + String(stab.tolerance, 2) + "°C\n";
         message += "   Порог тревоги: " + String(stab.alertThreshold, 2) + "°C\n";
-        message += "   Длительность: " + String(stab.duration) + "с";
+        message += "   Время наблюдения: " + String(stab.duration / 60) + " мин\n";
+        if (isStabilized()) {
+          message += "   ✅ Стабильная t°: " + String(getStabilizedTemp(), 1) + "°C";
+        } else {
+          message += "   🔍 Статус: Отслеживание";
+        }
       }
       
       sendTelegramMessageToQueue(chat_id, message);
@@ -749,56 +851,51 @@ void handleTelegramMessages() {
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command.startsWith("/stab_set") || command == "stab_set") {
-      // Парсинг команды: /stab_set <target> [tolerance] [alert] [duration]
-      // Используем оригинальный text для получения параметров (после удаления @botname)
+      // Парсинг команды: /stab_set [tolerance] [alert] [duration_min]
+      // Новая логика: без целевой температуры, отслеживание колебаний
       int firstSpace = text.indexOf(' ');
       if (firstSpace == -1) {
         String message = "❌ *Ошибка формата*\n\n";
-        message += "Использование: `/stab_set <target> [tolerance] [alert] [duration]`\n";
-        message += "Пример: `/stab_set 25 0.1 0.2 600`\n\n";
+        message += "Использование: `/stab_set [tolerance] [alert] [duration_min]`\n";
+        message += "Пример: `/stab_set 0.1 0.2 10`\n\n";
         message += "Параметры:\n";
-        message += "  target - целевая температура (°C)\n";
-        message += "  tolerance - допуск (по умолчанию 0.1°C)\n";
-        message += "  alert - порог тревоги (по умолчанию 0.2°C)\n";
-        message += "  duration - длительность в секундах (по умолчанию 600)";
+        message += "  tolerance - допуск колебаний (по умолчанию 0.1°C)\n";
+        message += "  alert - порог тревоги после стабилизации (по умолчанию 0.2°C)\n";
+        message += "  duration\\_min - время наблюдения в минутах (по умолчанию 10)";
         sendTelegramMessageToQueue(chat_id, message);
       } else {
         String params = text.substring(firstSpace + 1);
-        int spaces[4] = {-1, -1, -1, -1};
+        int spaces[3] = {-1, -1, -1};
         int spaceCount = 0;
-        for (int i = 0; i < params.length() && spaceCount < 3; i++) {
+        for (unsigned int i = 0; i < params.length() && spaceCount < 2; i++) {
           if (params.charAt(i) == ' ') {
             spaces[spaceCount] = i;
             spaceCount++;
           }
         }
-        
-        float targetTemp = params.substring(0, spaces[0] > 0 ? spaces[0] : params.length()).toFloat();
-        float tolerance = 0.1;
+
+        float tolerance = params.substring(0, spaces[0] > 0 ? spaces[0] : params.length()).toFloat();
         float alertThreshold = 0.2;
-        unsigned long duration = 600;
-        
+        unsigned long durationMin = 10;
+
         if (spaces[0] > 0) {
-          tolerance = params.substring(spaces[0] + 1, spaces[1] > 0 ? spaces[1] : params.length()).toFloat();
+          alertThreshold = params.substring(spaces[0] + 1, spaces[1] > 0 ? spaces[1] : params.length()).toFloat();
         }
         if (spaces[1] > 0) {
-          alertThreshold = params.substring(spaces[1] + 1, spaces[2] > 0 ? spaces[2] : params.length()).toFloat();
+          durationMin = params.substring(spaces[1] + 1).toInt();
         }
-        if (spaces[2] > 0) {
-          duration = params.substring(spaces[2] + 1).toInt();
-        }
-        
-        if (targetTemp <= 0 || tolerance <= 0 || alertThreshold <= 0 || duration <= 0) {
+
+        if (tolerance <= 0 || alertThreshold <= 0 || durationMin <= 0) {
           String message = "❌ *Ошибка*\n\n";
           message += "Все параметры должны быть положительными числами!";
           sendTelegramMessageToQueue(chat_id, message);
         } else {
-          setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+          unsigned long durationSec = durationMin * 60;
+          setStabilizationSettings(tolerance, alertThreshold, durationSec);
           String message = "✅ *Настройки стабилизации обновлены*\n\n";
-          message += "🎯 *Целевая температура:* " + String(targetTemp, 1) + "°C\n";
-          message += "📏 *Допуск:* ±" + String(tolerance, 2) + "°C\n";
+          message += "📏 *Допуск колебаний:* ±" + String(tolerance, 2) + "°C\n";
           message += "⚠️ *Порог тревоги:* " + String(alertThreshold, 2) + "°C\n";
-          message += "⏱️ *Длительность:* " + String(duration) + "с (" + String(duration / 60) + " мин)";
+          message += "⏱️ *Время наблюдения:* " + String(durationMin) + " мин";
           sendTelegramMessageToQueue(chat_id, message);
         }
       }
@@ -806,19 +903,21 @@ void handleTelegramMessages() {
     } else if (command == "/stab_get" || command == "stab_get") {
       StabilizationModeSettings stab = getStabilizationSettings();
       String message = "🎯 *Настройки стабилизации*\n\n";
-      message += "📌 *Целевая температура:* " + String(stab.targetTemp, 1) + "°C\n";
-      message += "📏 *Допуск:* ±" + String(stab.tolerance, 2) + "°C\n";
+      message += "📏 *Допуск колебаний:* ±" + String(stab.tolerance, 2) + "°C\n";
       message += "⚠️ *Порог тревоги:* " + String(stab.alertThreshold, 2) + "°C\n";
-      message += "⏱️ *Длительность:* " + String(stab.duration) + "с (" + String(stab.duration / 60) + " мин)";
-      
+      message += "⏱️ *Время наблюдения:* " + String(stab.duration / 60) + " мин";
+
       if (getOperationMode() == MODE_STABILIZATION) {
-        message += "\n\n📊 *Статус стабилизации:*\n";
-        message += "   Стабилизировано: " + String(isStabilized() ? "✅ Да" : "❌ Нет") + "\n";
+        message += "\n\n📊 *Статус:*\n";
         if (isStabilized()) {
-          message += "   Время: " + String(getStabilizationTime()) + "с";
+          message += "   ✅ Стабилизировано\n";
+          message += "   🌡️ Температура: " + String(getStabilizedTemp(), 1) + "°C";
+        } else {
+          message += "   🔍 Отслеживание\n";
+          message += "   ⏱️ Прошло: " + String(getStabilizationTime()) + " сек";
         }
       }
-      
+
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command == "/display_on" || command == "display_on") {
@@ -1030,7 +1129,10 @@ void setTelegramConfig(const String& token, const String& chatId) {
   telegramBotToken = token;
   telegramChatId = chatId;
   updateTelegramFlags();
-  ensureTelegramBot();
+  
+  // НЕ вызываем ensureTelegramBot() здесь - это может блокировать при сохранении настроек
+  // Бот будет инициализирован автоматически при следующей попытке отправки сообщения
+  // Это предотвращает блокировку при сохранении настроек, особенно если WiFi нестабилен
   
   Serial.print(F("Telegram config set: token="));
   Serial.print(telegramBotToken.length() > 0 ? "***" : "(empty)");
@@ -1040,6 +1142,14 @@ void setTelegramConfig(const String& token, const String& chatId) {
   Serial.print(telegramConfigured);
   Serial.print(F(", canSend="));
   Serial.println(telegramCanSend);
+  
+  // Сбрасываем инициализацию бота, чтобы он пересоздался при следующей отправке
+  telegramInitialized = false;
+  if (bot) {
+    delete bot;
+    bot = nullptr;
+  }
+  telegramActiveToken = "";
 }
 
 bool isTelegramConfigured() {

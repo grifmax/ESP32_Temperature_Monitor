@@ -74,10 +74,10 @@ struct SensorConfig {
   float alertMinTemp;
   float alertMaxTemp;
   bool alertBuzzerEnabled;
-  float stabTargetTemp;
-  float stabTolerance;
-  float stabAlertThreshold;
-  unsigned long stabDuration;
+  // Настройки стабилизации (без targetTemp - новая логика отслеживания колебаний)
+  float stabTolerance;        // Допуск колебаний ±°C (по умолчанию 0.1)
+  float stabAlertThreshold;   // Порог тревоги после стабилизации (по умолчанию 0.2)
+  unsigned long stabDuration; // Время наблюдения в мс (по умолчанию 10 минут)
   float monitoringThreshold;  // Уставка изменения температуры для отправки в режиме мониторинга (°C)
   bool valid;
 };
@@ -88,11 +88,16 @@ int sensorConfigCount = 0;
 unsigned long lastSettingsReload = 0;
 const unsigned long SETTINGS_RELOAD_INTERVAL = 30000; // Перезагружаем настройки каждые 30 секунд
 
-// Состояния для отслеживания отправки
+// Состояния для отслеживания отправки и стабилизации
 struct SensorState {
   float lastSentTemp;
-  unsigned long stabilizationStartTime;
-  bool isStabilized;
+  // Данные для режима стабилизации (новая логика)
+  unsigned long trackingStartTime;  // Начало периода отслеживания
+  float minTempInPeriod;            // Минимальная температура за период
+  float maxTempInPeriod;            // Максимальная температура за период
+  float stabilizedTemp;             // Температура при достижении стабилизации
+  bool isStabilized;                // Флаг достижения стабилизации
+  bool alertSent;                   // Флаг отправки тревоги (чтобы не спамить)
 };
 SensorState sensorStates[MAX_SENSORS];
 bool forceReloadSettings = false; // Флаг для принудительной перезагрузки настроек
@@ -348,8 +353,12 @@ void setup() {
   // Инициализация состояний термометров
   for (int i = 0; i < MAX_SENSORS; i++) {
     sensorStates[i].lastSentTemp = 0.0;
-    sensorStates[i].stabilizationStartTime = 0;
+    sensorStates[i].trackingStartTime = 0;
+    sensorStates[i].minTempInPeriod = 999.0;
+    sensorStates[i].maxTempInPeriod = -999.0;
+    sensorStates[i].stabilizedTemp = 0.0;
     sensorStates[i].isStabilized = false;
+    sensorStates[i].alertSent = false;
     sensorConfigs[i].valid = false;
   }
   
@@ -519,18 +528,16 @@ void loadSensorConfigs() {
       config.alertBuzzerEnabled = true;
     }
     
-    // Настройки стабилизации
+    // Настройки стабилизации (новая логика - отслеживание колебаний)
     if (sensor.containsKey("stabilizationSettings")) {
       JsonObject stab = sensor["stabilizationSettings"];
-      config.stabTargetTemp = stab["targetTemp"] | 25.0;
       config.stabTolerance = stab["tolerance"] | 0.1;
       config.stabAlertThreshold = stab["alertThreshold"] | 0.2;
-      config.stabDuration = (stab["duration"] | 10) * 1000; // Конвертируем в миллисекунды
+      config.stabDuration = (stab["duration"] | 10) * 60 * 1000; // Конвертируем минуты в миллисекунды
     } else {
-      config.stabTargetTemp = 25.0;
       config.stabTolerance = 0.1;
       config.stabAlertThreshold = 0.2;
-      config.stabDuration = 10000; // 10 секунд по умолчанию
+      config.stabDuration = 10 * 60 * 1000; // 10 минут по умолчанию
     }
     
     config.valid = true;
@@ -757,58 +764,95 @@ void loop() {
           }
         }
       } else if (config->mode == "stabilization") {
-        float diff = abs(correctedTemp - config->stabTargetTemp);
-        
-        // Проверка стабилизации
-        if (diff <= config->stabTolerance) {
-          if (!sensorStates[i].isStabilized) {
-            sensorStates[i].isStabilized = true;
-            sensorStates[i].stabilizationStartTime = millis();
-          }
-          
-          if (millis() - sensorStates[i].stabilizationStartTime >= config->stabDuration) {
-            buzzerBeep(BUZZER_STABILIZATION);
-            sensorStates[i].stabilizationStartTime = millis() + 60000; // Не отправляем снова в течение минуты
-            
-            // Отправляем метрики только если WiFi подключен
-            if (WiFi.status() == WL_CONNECTED) {
-              sendMetricsToTelegram("", -127.0); // Пустое имя означает "отправить все"
-              
-              // Обновляем lastSentTemp для всех термометров (упрощенная версия)
-              for (int j = 0; j < sensorCount && j < MAX_SENSORS; j++) {
-                if (j == i) {
-                  sensorStates[j].lastSentTemp = correctedTemp;
-                  continue;
-                }
-                uint8_t addr[8];
-                if (getSensorAddress(j, addr)) {
-                  String addrStr = getSensorAddressString(j);
-                  for (int k = 0; k < sensorConfigCount; k++) {
-                    if (sensorConfigs[k].valid && sensorConfigs[k].address == addrStr) {
-                      float temp = getSensorTemperature(j);
-                      float corr = (temp != -127.0) ? (temp + sensorConfigs[k].correction) : -127.0;
-                      if (corr != -127.0) {
-                        sensorStates[j].lastSentTemp = corr;
-                      }
-                      break;
-                    }
-                  }
-                }
-                yield(); // Даем время другим задачам
+        // Новая логика стабилизации: отслеживание колебаний температуры
+        unsigned long now = millis();
+
+        // Инициализация периода отслеживания
+        if (sensorStates[i].trackingStartTime == 0) {
+          sensorStates[i].trackingStartTime = now;
+          sensorStates[i].minTempInPeriod = correctedTemp;
+          sensorStates[i].maxTempInPeriod = correctedTemp;
+          sensorStates[i].alertSent = false;
+        }
+
+        // Обновляем min/max за период
+        if (correctedTemp < sensorStates[i].minTempInPeriod) {
+          sensorStates[i].minTempInPeriod = correctedTemp;
+        }
+        if (correctedTemp > sensorStates[i].maxTempInPeriod) {
+          sensorStates[i].maxTempInPeriod = correctedTemp;
+        }
+
+        if (!sensorStates[i].isStabilized) {
+          // ФАЗА ОТСЛЕЖИВАНИЯ: ждём стабилизации
+          unsigned long elapsedTime = now - sensorStates[i].trackingStartTime;
+
+          if (elapsedTime >= config->stabDuration) {
+            // Время прошло - проверяем колебания
+            float tempRange = sensorStates[i].maxTempInPeriod - sensorStates[i].minTempInPeriod;
+
+            if (tempRange <= config->stabTolerance * 2) {
+              // Стабилизация достигнута!
+              sensorStates[i].isStabilized = true;
+              sensorStates[i].stabilizedTemp = (sensorStates[i].minTempInPeriod + sensorStates[i].maxTempInPeriod) / 2.0;
+              sensorStates[i].alertSent = false;
+
+              Serial.print(F("Sensor "));
+              Serial.print(config->name);
+              Serial.print(F(" stabilized at "));
+              Serial.print(sensorStates[i].stabilizedTemp);
+              Serial.println(F("°C"));
+
+              // Уведомление о стабилизации
+              buzzerBeep(BUZZER_STABILIZATION);
+
+              if (WiFi.status() == WL_CONNECTED && config->sendToNetworks) {
+                String msg = "✅ " + config->name + " стабилизировался на " + String(sensorStates[i].stabilizedTemp, 1) + "°C";
+                sendTemperatureAlert(config->name, sensorStates[i].stabilizedTemp, msg);
               }
+
+              sensorStates[i].lastSentTemp = correctedTemp;
+            } else {
+              // Колебания слишком большие - сбрасываем период
+              sensorStates[i].trackingStartTime = now;
+              sensorStates[i].minTempInPeriod = correctedTemp;
+              sensorStates[i].maxTempInPeriod = correctedTemp;
             }
-            break; // Обработали, выходим
           }
         } else {
-          sensorStates[i].isStabilized = false;
-        }
-        
-        // Проверка тревоги стабилизации
-        if (diff > config->stabAlertThreshold) {
-          if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
-            sendTemperatureAlert(config->name, correctedTemp, "⚠️ Отклонение от целевой температуры!");
-            buzzerBeep(BUZZER_ALERT);
-            sensorStates[i].lastSentTemp = correctedTemp;
+          // ФАЗА СТАБИЛИЗАЦИИ: следим за отклонениями
+          float diff = abs(correctedTemp - sensorStates[i].stabilizedTemp);
+
+          if (diff > config->stabAlertThreshold) {
+            // Температура отклонилась - ТРЕВОГА!
+            if (!sensorStates[i].alertSent) {
+              Serial.print(F("Stabilization alert for "));
+              Serial.print(config->name);
+              Serial.print(F(": "));
+              Serial.print(correctedTemp);
+              Serial.print(F("°C (was "));
+              Serial.print(sensorStates[i].stabilizedTemp);
+              Serial.println(F("°C)"));
+
+              buzzerBeep(BUZZER_ALERT);
+
+              if (WiFi.status() == WL_CONNECTED && config->sendToNetworks) {
+                String direction = (correctedTemp > sensorStates[i].stabilizedTemp) ? "выросла" : "упала";
+                String msg = "⚠️ " + config->name + ": температура " + direction + " на " +
+                             String(diff, 1) + "°C (было " + String(sensorStates[i].stabilizedTemp, 1) +
+                             "°C, стало " + String(correctedTemp, 1) + "°C)";
+                sendTemperatureAlert(config->name, correctedTemp, msg);
+              }
+
+              sensorStates[i].alertSent = true;
+              sensorStates[i].lastSentTemp = correctedTemp;
+            }
+
+            // Возвращаемся в режим отслеживания
+            sensorStates[i].isStabilized = false;
+            sensorStates[i].trackingStartTime = now;
+            sensorStates[i].minTempInPeriod = correctedTemp;
+            sensorStates[i].maxTempInPeriod = correctedTemp;
           }
         }
       }

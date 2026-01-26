@@ -156,7 +156,6 @@ async function loadSensors() {
                     buzzerEnabled: true
                 },
                 stabilizationSettings: {
-                    targetTemp: 25.0,
                     tolerance: 0.1,
                     alertThreshold: 0.2,
                     duration: 10,
@@ -179,7 +178,7 @@ async function loadSensors() {
             sendToNetworks: true,
             buzzerEnabled: false,
             alertSettings: { minTemp: 10.0, maxTemp: 30.0, buzzerEnabled: true },
-            stabilizationSettings: { targetTemp: 25.0, tolerance: 0.1, alertThreshold: 0.2, duration: 10, buzzerEnabled: true }
+            stabilizationSettings: { tolerance: 0.1, alertThreshold: 0.2, duration: 10, buzzerEnabled: true }
         }];
         renderSensorCells();
         updateChartSensorSelectors();
@@ -228,16 +227,20 @@ function renderSensorCells() {
                 </div>
             `;
         } else if (sensor.mode === 'stabilization' && sensor.stabilizationSettings) {
+            const isStabilized = sensorData.isStabilized || false;
+            const stabilizedTemp = sensorData.stabilizedTemp || 0;
+            const state = isStabilized ? 'stabilized' : 'tracking';
             const stateNames = {
-                'heating': 'Нагрев',
-                'cooling': 'Охлаждение',
-                'tracking': 'Отслеживание'
+                'stabilized': '✅ Стабильно',
+                'tracking': '🔍 Отслеживание'
             };
-            const state = sensorData.stabilizationState || 'tracking';
+            const stateInfo = isStabilized
+                ? `${stabilizedTemp.toFixed(1)}°C ±${sensor.stabilizationSettings.alertThreshold}°C`
+                : `±${sensor.stabilizationSettings.tolerance}°C / ${sensor.stabilizationSettings.duration} мин`;
             modeDataHtml = `
                 <div class="sensor-data">
                     <span class="stabilization-state">${stateNames[state]}</span>
-                    <span class="stabilization-threshold">Порог: ${sensor.stabilizationSettings.alertThreshold}°C</span>
+                    <span class="stabilization-threshold">${stateInfo}</span>
                 </div>
             `;
         }
@@ -304,7 +307,6 @@ function openSensorSettings(sensorId) {
     
     // Настройки стабилизации
     if (sensor.stabilizationSettings) {
-        document.getElementById('modal-stab-target-temp').value = sensor.stabilizationSettings.targetTemp || 25.0;
         document.getElementById('modal-stab-tolerance').value = sensor.stabilizationSettings.tolerance || 0.1;
         document.getElementById('modal-stab-alert-threshold').value = sensor.stabilizationSettings.alertThreshold || 0.2;
         document.getElementById('modal-stab-duration').value = sensor.stabilizationSettings.duration || 10;
@@ -413,7 +415,6 @@ async function saveSensorSettings() {
 
     if (sensor.mode === 'stabilization') {
         if (!sensor.stabilizationSettings) sensor.stabilizationSettings = {};
-        sensor.stabilizationSettings.targetTemp = parseFloat(document.getElementById('modal-stab-target-temp').value) || 25.0;
         sensor.stabilizationSettings.tolerance = parseFloat(document.getElementById('modal-stab-tolerance').value) || 0.1;
         sensor.stabilizationSettings.alertThreshold = parseFloat(document.getElementById('modal-stab-alert-threshold').value) || 0.2;
         sensor.stabilizationSettings.duration = parseInt(document.getElementById('modal-stab-duration').value) || 10;
@@ -437,7 +438,6 @@ async function saveSensorSettings() {
                 buzzerEnabled: true
             },
             stabilizationSettings: s.stabilizationSettings || {
-                targetTemp: 25.0,
                 tolerance: 0.1,
                 alertThreshold: 0.2,
                 duration: 10
