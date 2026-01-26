@@ -255,40 +255,10 @@ function showMessage(text, type) {
     const messageEl = document.getElementById('message');
     messageEl.textContent = text;
     messageEl.className = 'message ' + type + ' show';
-
+    
     setTimeout(() => {
         messageEl.classList.remove('show');
     }, 5000);
-}
-
-// Функция polling статуса сохранения
-async function waitForSaveComplete(maxAttempts = 20, intervalMs = 500) {
-    for (let i = 0; i < maxAttempts; i++) {
-        try {
-            const response = await fetch('/api/settings/status');
-            if (!response.ok) {
-                // Если эндпоинт не существует (старая прошивка), считаем успешным
-                return { success: true, message: 'Settings saved' };
-            }
-            const status = await response.json();
-
-            if (status.status === 'success') {
-                return { success: true, message: status.message };
-            } else if (status.status === 'error') {
-                return { success: false, message: status.message };
-            } else if (status.status === 'idle') {
-                // Сохранение уже завершено
-                return { success: true, message: 'Settings saved' };
-            }
-            // status === 'saving' - продолжаем ждать
-            await new Promise(resolve => setTimeout(resolve, intervalMs));
-        } catch (error) {
-            console.error('Error checking save status:', error);
-            // При ошибке сети считаем что сохранение прошло
-            return { success: true, message: 'Settings saved (status check failed)' };
-        }
-    }
-    return { success: false, message: 'Save timeout - please check settings' };
 }
 
 // Функция загрузки настроек
@@ -399,14 +369,13 @@ async function saveSettings(section) {
                 const modeSelect = document.getElementById(`sensor-mode-${idx}`);
                 const enabledCheckbox = document.getElementById(`sensor-enabled-${idx}`);
                 const correctionInput = document.getElementById(`sensor-correction-${idx}`);
-
+                
                 return {
                     address: s.address || '',
                     name: nameInput ? nameInput.value.trim() : (s.name || ''),
                     enabled: enabledCheckbox ? enabledCheckbox.checked : (s.enabled !== undefined ? s.enabled : true),
                     correction: correctionInput ? (parseFloat(correctionInput.value) || 0.0) : (s.correction || 0.0),
                     mode: modeSelect ? modeSelect.value : (s.mode || 'monitoring'),
-                    monitoringThreshold: s.monitoringThreshold !== undefined ? s.monitoringThreshold : 1.0,
                     sendToNetworks: s.sendToNetworks !== undefined ? s.sendToNetworks : true,
                     buzzerEnabled: s.buzzerEnabled || false,
                     alertSettings: s.alertSettings || {
@@ -415,126 +384,53 @@ async function saveSettings(section) {
                         buzzerEnabled: true
                     },
                     stabilizationSettings: s.stabilizationSettings || {
+                        targetTemp: 25.0,
                         tolerance: 0.1,
                         alertThreshold: 0.2,
                         duration: 10
                     }
                 };
             });
-
+            
             // Отправляем через специальный API для датчиков
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 секунд таймаут
-
-            try {
-                showMessage('Сохранение настроек термометров...', 'success');
-
-                const sensorsResponse = await fetch('/api/sensors', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ sensors: sensorsToSave }),
-                    signal: controller.signal
-                });
-
-                clearTimeout(timeoutId);
-
-                if (sensorsResponse.status === 503) {
-                    throw new Error('Сервер занят. Попробуйте через несколько секунд.');
-                }
-
-                if (!sensorsResponse.ok) {
-                    let errorMsg = 'Ошибка сохранения настроек термометров';
-                    try {
-                        const errorData = await sensorsResponse.json();
-                        if (errorData.error || errorData.message) {
-                            errorMsg = errorData.error || errorData.message;
-                        }
-                    } catch (e) {
-                        // Игнорируем ошибку парсинга JSON
-                    }
-                    throw new Error(errorMsg);
-                }
-
-                // Ждём небольшую задержку для завершения записи
-                await new Promise(resolve => setTimeout(resolve, 500));
-
-            } catch (error) {
-                clearTimeout(timeoutId);
-                if (error.name === 'AbortError') {
-                    throw new Error('Таймаут при сохранении настроек термометров. Попробуйте еще раз.');
-                }
-                throw error;
+            const sensorsResponse = await fetch('/api/sensors', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ sensors: sensorsToSave })
+            });
+            
+            if (!sensorsResponse.ok) {
+                throw new Error('Ошибка сохранения настроек термометров');
             }
-
+            
             // Перезагружаем список термометров после сохранения
             await loadSensors();
             renderSensors(); // Обновляем отображение в настройках
             showMessage('Настройки термометров сохранены', 'success');
-            return; // Выходим после сохранения датчиков
         }
         
         // Сохраняем остальные настройки, если они есть
         if (Object.keys(settings).length > 0) {
-            // Создаем AbortController для таймаута
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 секунд таймаут
-
-            try {
-                const response = await fetch('/api/settings', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(settings),
-                    signal: controller.signal
-                });
-
-                clearTimeout(timeoutId);
-
-                // Проверяем статус ответа
-                if (response.status === 503) {
-                    throw new Error('Сервер занят другим сохранением. Попробуйте через несколько секунд.');
-                }
-
-                if (!response.ok && response.status !== 202) {
-                    // Пытаемся получить детали ошибки из ответа
-                    let errorMsg = 'Ошибка сохранения настроек';
-                    try {
-                        const errorData = await response.json();
-                        if (errorData.message) {
-                            errorMsg = errorData.message;
-                        }
-                    } catch (e) {
-                        // Игнорируем ошибку парсинга JSON
-                    }
-                    throw new Error(errorMsg);
-                }
-
-                // Если сервер принял запрос (202 Accepted), ждём завершения сохранения
-                if (response.status === 202) {
-                    showMessage('Сохранение настроек...', 'success');
-                    const saveResult = await waitForSaveComplete();
-                    if (!saveResult.success) {
-                        throw new Error(saveResult.message);
-                    }
-                }
-            } catch (error) {
-                clearTimeout(timeoutId);
-                if (error.name === 'AbortError') {
-                    throw new Error('Таймаут при сохранении настроек. Попробуйте еще раз.');
-                }
-                throw error;
+            const response = await fetch('/api/settings', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(settings)
+            });
+            
+            if (!response.ok) {
+                throw new Error('Ошибка сохранения настроек');
             }
         }
-
+        
         showMessage('Настройки успешно сохранены', 'success');
         updateServiceStatus();
     } catch (error) {
         console.error('Error saving settings:', error);
         showMessage('Ошибка сохранения настроек: ' + error.message, 'error');
-        // Не перезагружаем страницу, чтобы пользователь мог увидеть ошибку
     }
 }
 
@@ -579,20 +475,42 @@ async function updateServiceStatus() {
 let sensors = [];
 const MAX_SENSORS = 10;
 
-// Исправлено: функция теперь async и возвращает Promise
-async function loadSensors() {
+function loadSensors() {
     const sensorsList = document.getElementById('sensors-list');
     if (!sensorsList) return;
-
-    try {
-        const response = await fetch('/api/sensors');
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        const data = await response.json();
-        sensors = data.sensors || [];
-
-        if (sensors.length === 0) {
+    
+    // Загружаем из API
+    fetch('/api/sensors')
+        .then(response => response.json())
+        .then(data => {
+            sensors = data.sensors || [];
+            if (sensors.length === 0) {
+                sensors = [{
+                    id: 1,
+                    name: 'Термометр 1',
+                    enabled: true,
+                    correction: 0.0,
+                    mode: 'monitoring',
+                    sendToNetworks: true,
+                    buzzerEnabled: false,
+                    alertSettings: {
+                        minTemp: 10.0,
+                        maxTemp: 30.0,
+                        buzzerEnabled: true
+                    },
+                    stabilizationSettings: {
+                        targetTemp: 25.0,
+                        tolerance: 0.1,
+                        alertThreshold: 0.2,
+                        duration: 10
+                    }
+                }];
+            }
+            renderSensors();
+        })
+        .catch(error => {
+            console.error('Error loading sensors:', error);
+            // Создаем один по умолчанию
             sensors = [{
                 id: 1,
                 name: 'Термометр 1',
@@ -607,37 +525,14 @@ async function loadSensors() {
                     buzzerEnabled: true
                 },
                 stabilizationSettings: {
+                    targetTemp: 25.0,
                     tolerance: 0.1,
                     alertThreshold: 0.2,
                     duration: 10
                 }
             }];
-        }
-        renderSensors();
-    } catch (error) {
-        console.error('Error loading sensors:', error);
-        // Создаем один по умолчанию
-        sensors = [{
-            id: 1,
-            name: 'Термометр 1',
-            enabled: true,
-            correction: 0.0,
-            mode: 'monitoring',
-            sendToNetworks: true,
-            buzzerEnabled: false,
-            alertSettings: {
-                minTemp: 10.0,
-                maxTemp: 30.0,
-                buzzerEnabled: true
-            },
-            stabilizationSettings: {
-                tolerance: 0.1,
-                alertThreshold: 0.2,
-                duration: 10
-            }
-        }];
-        renderSensors();
-    }
+            renderSensors();
+        });
 }
 
 function renderSensors() {
@@ -895,6 +790,64 @@ async function updateSensorsTemperature() {
         }
     } catch (error) {
         console.error('Error updating sensors temperature:', error);
+    }
+}
+
+// ===== БЕЗОПАСНОСТЬ =====
+
+// Смена пароля
+async function changePassword() {
+    const currentPass = document.getElementById('current-password').value;
+    const newPass = document.getElementById('new-password').value;
+    const confirmPass = document.getElementById('confirm-password').value;
+
+    if (!currentPass || !newPass || !confirmPass) {
+        showMessage('Заполните все поля', 'error');
+        return;
+    }
+
+    if (newPass !== confirmPass) {
+        showMessage('Новые пароли не совпадают', 'error');
+        return;
+    }
+
+    if (newPass.length < 4) {
+        showMessage('Пароль должен быть минимум 4 символа', 'error');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/auth/password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                currentPassword: currentPass,
+                newPassword: newPass
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            showMessage('Пароль успешно изменён', 'success');
+            document.getElementById('current-password').value = '';
+            document.getElementById('new-password').value = '';
+            document.getElementById('confirm-password').value = '';
+        } else {
+            showMessage(data.error || 'Ошибка смены пароля', 'error');
+        }
+    } catch (e) {
+        showMessage('Ошибка подключения', 'error');
+    }
+}
+
+// Выход из системы
+async function logout() {
+    try {
+        await fetch('/api/auth/logout', { method: 'POST' });
+        window.location.href = '/login.html';
+    } catch (e) {
+        window.location.href = '/login.html';
     }
 }
 

@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <U8g2lib.h>
 #include "sensors.h"
+#include "sensor_config.h"
 
 // OLED 0.91" 128x32 SSD1306
 extern U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C display;
@@ -11,28 +12,6 @@ extern int displayScreen;
 extern String deviceIP;
 extern unsigned long deviceUptime;
 extern int wifiRSSI;
-// Forward declaration для SensorConfig
-struct SensorConfig {
-  String address;
-  String name;
-  bool enabled;
-  float correction;
-  String mode;
-  bool sendToNetworks;
-  bool buzzerEnabled;
-  float alertMinTemp;
-  float alertMaxTemp;
-  bool alertBuzzerEnabled;
-  float stabTargetTemp;
-  float stabTolerance;
-  float stabAlertThreshold;
-  unsigned long stabDuration;
-  float monitoringThreshold;  // Уставка изменения температуры для отправки в режиме мониторинга (°C)
-  bool valid;
-};
-
-extern SensorConfig sensorConfigs[];
-extern int sensorConfigCount;
 
 static int lastDisplayScreen = DISPLAY_OFF;
 static int currentSensorIndex = 0; // Индекс текущего отображаемого термометра

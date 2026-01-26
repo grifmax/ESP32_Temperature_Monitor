@@ -15,43 +15,7 @@
 #include "sensors.h"
 #include "display.h"
 #include "buzzer.h"
-
-// Forward declaration для доступа к кешу настроек из main.cpp
-struct SensorConfig {
-  String address;
-  String name;
-  bool enabled;
-  float correction;
-  String mode;
-  bool sendToNetworks;
-  bool buzzerEnabled;
-  float alertMinTemp;
-  float alertMaxTemp;
-  bool alertBuzzerEnabled;
-  float stabTolerance;
-  float stabAlertThreshold;
-  unsigned long stabDuration;
-  float monitoringThreshold;
-  bool valid;
-};
-extern SensorConfig sensorConfigs[];
-extern int sensorConfigCount;
-
-// Forward declaration для состояний термометров из main.cpp
-struct SensorState {
-  float lastSentTemp;
-  unsigned long trackingStartTime;
-  float minTempInPeriod;
-  float maxTempInPeriod;
-  float stabilizedTemp;
-  bool isStabilized;
-  bool alertSent;
-};
-extern SensorState sensorStates[];
-
-// Forward declaration для перезагрузки настроек
-extern bool forceReloadSettings;
-void loadSensorConfigs();
+#include "sensor_config.h"
 
 extern float currentTemp;
 extern unsigned long deviceUptime;
@@ -83,7 +47,7 @@ bool telegramSendInProgress = false;
 unsigned long lastTelegramSendAttempt = 0;
 unsigned long lastTelegramSendSuccess = 0;
 const unsigned long TELEGRAM_SEND_INTERVAL = 2000; // Минимум 2 секунды между отправками
-const unsigned long TELEGRAM_SEND_TIMEOUT = 8000; // Таймаут отправки 8 секунд (увеличено для медленных соединений)
+const unsigned long TELEGRAM_SEND_TIMEOUT = 5000; // Таймаут отправки 5 секунд
 int telegramConsecutiveFailures = 0;
 const int MAX_TELEGRAM_FAILURES = 3; // После 3 неудач подряд - пауза
 
@@ -105,26 +69,18 @@ void ensureTelegramBot() {
       bot = nullptr;
     }
     telegramActiveToken = "";
-    return; // Убрали лишнее логирование
+    Serial.println(F("Telegram: Bot not configured"));
+    return;
   }
   if (!bot || telegramActiveToken != telegramBotToken) {
     if (bot) {
       delete bot;
-      bot = nullptr;
     }
-    // Создаем бота только если WiFi подключен, чтобы не блокировать систему
-    if (WiFi.status() == WL_CONNECTED) {
-      bot = new UniversalTelegramBot(telegramBotToken, secured_client);
-      telegramActiveToken = telegramBotToken;
-      telegramInitialized = true;
-      Serial.println(F("Telegram: Bot initialized"));
-    } else {
-      // WiFi не подключен - не создаем бота, чтобы не блокировать
-      telegramInitialized = false;
-    }
-  } else {
-    telegramInitialized = true;
+    bot = new UniversalTelegramBot(telegramBotToken, secured_client);
+    telegramActiveToken = telegramBotToken;
+    Serial.println(F("Telegram: Bot initialized"));
   }
+  telegramInitialized = true;
 }
 
 // Инициализация очереди Telegram сообщений
@@ -281,21 +237,8 @@ void processTelegramQueue() {
       return;
     }
     
-    // Убеждаемся, что WiFi не отключится во время операции
-    // Сохраняем состояние WiFi перед операцией
-    bool wifiWasConnected = (WiFi.status() == WL_CONNECTED);
-    IPAddress savedIP = WiFi.localIP();
-    
-    // Пересоздаем SSL клиент при необходимости для сброса состояния
-    // Это помогает при проблемах с "висящими" SSL соединениями
-    static unsigned long lastClientReset = 0;
-    if (millis() - lastClientReset > 60000) { // Раз в минуту
-      secured_client.stop();
-      yield();
-      lastClientReset = millis();
-    }
-    
-    // Убеждаемся, что WiFi все еще подключен перед отправкой
+    // Пытаемся отправить с обработкой ошибок DNS
+    // Проверяем WiFi еще раз перед отправкой
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram: WiFi disconnected before send, skipping"));
       delete msg;
@@ -304,32 +247,12 @@ void processTelegramQueue() {
       return;
     }
     
-    // Пытаемся отправить сообщение
-    // sendMessage может занять много времени при проблемах с SSL
     bool success = bot->sendMessage(msg->chatId, msg->message, parseMode);
     
-    // Проверяем WiFi после отправки
+    // Проверяем, не отключился ли WiFi после отправки
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram: WiFi disconnected after send attempt"));
       success = false;
-      // Если WiFi отключился, пытаемся переподключиться
-      if (wifiWasConnected && savedIP != IPAddress(0, 0, 0, 0)) {
-        Serial.println(F("Telegram: Attempting WiFi reconnect"));
-        WiFi.disconnect();
-        yield();
-        WiFi.begin(); // Пытаемся переподключиться к последней сети
-        // Даем время на переподключение
-        for (int i = 0; i < 10 && WiFi.status() != WL_CONNECTED; i++) {
-          delay(500);
-          yield();
-        }
-      }
-    } else if (!success) {
-      // Если отправка не удалась, но WiFi подключен, возможно проблема с SSL
-      Serial.println(F("Telegram: Send failed but WiFi connected, possible SSL issue"));
-      // Пересоздаем SSL клиент для следующей попытки
-      secured_client.stop();
-      yield();
     }
     
     unsigned long sendDuration = millis() - sendStart;
@@ -443,8 +366,7 @@ void startTelegramBot() {
   // В продакшене следует использовать setCACert() с правильным сертификатом
   secured_client.setInsecure(); // Используется для тестирования
   // Устанавливаем таймауты для предотвращения зависаний
-  // Увеличиваем таймауты для стабильности при медленных соединениях
-  secured_client.setTimeout(15); // 15 секунд таймаут для подключения и операций
+  secured_client.setTimeout(5); // 5 секунд таймаут для подключения
   ensureTelegramBot();
   initTelegramQueue(); // Инициализируем очередь
 
@@ -588,16 +510,9 @@ void handleTelegramMessages() {
       message += "   Пример: `/alert_set 10 30 1`\n";
       message += "🔹 `/alert_get` - текущие настройки\n\n";
       message += "🎯 *Настройка стабилизации:*\n";
-      message += "🔹 `/stab_set [tolerance] [alert] [duration_min]`\n";
-      message += "   Пример: `/stab_set 0.1 0.2 10`\n";
+      message += "🔹 `/stab_set <target> [tolerance] [alert] [duration]`\n";
+      message += "   Пример: `/stab_set 25 0.1 0.2 600`\n";
       message += "🔹 `/stab_get` - текущие настройки\n\n";
-      message += "🌡️ *Настройка термометров:*\n";
-      message += "🔹 `/sensor_list` - список термометров\n";
-      message += "🔹 `/sensor_name <n> <имя>` - переименовать\n";
-      message += "🔹 `/sensor_mode <n> <режим>` - установить режим\n";
-      message += "   Режимы: monitoring, alert, stabilization\n";
-      message += "🔹 `/sensor_alert <n> <min> <max>` - пороги оповещения\n";
-      message += "🔹 `/sensor_stab <n> <tol> <alert> <min>` - настройки стабилизации\n\n";
       message += "📺 *Управление дисплеем:*\n";
       message += "🔹 `/display_on` - включить дисплей\n";
       message += "🔹 `/display_off` - выключить дисплей\n";
@@ -748,14 +663,10 @@ void handleTelegramMessages() {
       } else if (mode == MODE_STABILIZATION) {
         StabilizationModeSettings stab = getStabilizationSettings();
         message += "🎯 *Настройки стабилизации:*\n";
-        message += "   Допуск колебаний: ±" + String(stab.tolerance, 2) + "°C\n";
+        message += "   Целевая: " + String(stab.targetTemp, 1) + "°C\n";
+        message += "   Допуск: " + String(stab.tolerance, 2) + "°C\n";
         message += "   Порог тревоги: " + String(stab.alertThreshold, 2) + "°C\n";
-        message += "   Время наблюдения: " + String(stab.duration / 60) + " мин\n";
-        if (isStabilized()) {
-          message += "   ✅ Стабильная t°: " + String(getStabilizedTemp(), 1) + "°C";
-        } else {
-          message += "   🔍 Статус: Отслеживание";
-        }
+        message += "   Длительность: " + String(stab.duration) + "с";
       }
       
       sendTelegramMessageToQueue(chat_id, message);
@@ -873,51 +784,56 @@ void handleTelegramMessages() {
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command.startsWith("/stab_set") || command == "stab_set") {
-      // Парсинг команды: /stab_set [tolerance] [alert] [duration_min]
-      // Новая логика: без целевой температуры, отслеживание колебаний
+      // Парсинг команды: /stab_set <target> [tolerance] [alert] [duration]
+      // Используем оригинальный text для получения параметров (после удаления @botname)
       int firstSpace = text.indexOf(' ');
       if (firstSpace == -1) {
         String message = "❌ *Ошибка формата*\n\n";
-        message += "Использование: `/stab_set [tolerance] [alert] [duration_min]`\n";
-        message += "Пример: `/stab_set 0.1 0.2 10`\n\n";
+        message += "Использование: `/stab_set <target> [tolerance] [alert] [duration]`\n";
+        message += "Пример: `/stab_set 25 0.1 0.2 600`\n\n";
         message += "Параметры:\n";
-        message += "  tolerance - допуск колебаний (по умолчанию 0.1°C)\n";
-        message += "  alert - порог тревоги после стабилизации (по умолчанию 0.2°C)\n";
-        message += "  duration\\_min - время наблюдения в минутах (по умолчанию 10)";
+        message += "  target - целевая температура (°C)\n";
+        message += "  tolerance - допуск (по умолчанию 0.1°C)\n";
+        message += "  alert - порог тревоги (по умолчанию 0.2°C)\n";
+        message += "  duration - длительность в секундах (по умолчанию 600)";
         sendTelegramMessageToQueue(chat_id, message);
       } else {
         String params = text.substring(firstSpace + 1);
-        int spaces[3] = {-1, -1, -1};
+        int spaces[4] = {-1, -1, -1, -1};
         int spaceCount = 0;
-        for (unsigned int i = 0; i < params.length() && spaceCount < 2; i++) {
+        for (int i = 0; i < params.length() && spaceCount < 3; i++) {
           if (params.charAt(i) == ' ') {
             spaces[spaceCount] = i;
             spaceCount++;
           }
         }
-
-        float tolerance = params.substring(0, spaces[0] > 0 ? spaces[0] : params.length()).toFloat();
+        
+        float targetTemp = params.substring(0, spaces[0] > 0 ? spaces[0] : params.length()).toFloat();
+        float tolerance = 0.1;
         float alertThreshold = 0.2;
-        unsigned long durationMin = 10;
-
+        unsigned long duration = 600;
+        
         if (spaces[0] > 0) {
-          alertThreshold = params.substring(spaces[0] + 1, spaces[1] > 0 ? spaces[1] : params.length()).toFloat();
+          tolerance = params.substring(spaces[0] + 1, spaces[1] > 0 ? spaces[1] : params.length()).toFloat();
         }
         if (spaces[1] > 0) {
-          durationMin = params.substring(spaces[1] + 1).toInt();
+          alertThreshold = params.substring(spaces[1] + 1, spaces[2] > 0 ? spaces[2] : params.length()).toFloat();
         }
-
-        if (tolerance <= 0 || alertThreshold <= 0 || durationMin <= 0) {
+        if (spaces[2] > 0) {
+          duration = params.substring(spaces[2] + 1).toInt();
+        }
+        
+        if (targetTemp <= 0 || tolerance <= 0 || alertThreshold <= 0 || duration <= 0) {
           String message = "❌ *Ошибка*\n\n";
           message += "Все параметры должны быть положительными числами!";
           sendTelegramMessageToQueue(chat_id, message);
         } else {
-          unsigned long durationSec = durationMin * 60;
-          setStabilizationSettings(tolerance, alertThreshold, durationSec);
+          setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
           String message = "✅ *Настройки стабилизации обновлены*\n\n";
-          message += "📏 *Допуск колебаний:* ±" + String(tolerance, 2) + "°C\n";
+          message += "🎯 *Целевая температура:* " + String(targetTemp, 1) + "°C\n";
+          message += "📏 *Допуск:* ±" + String(tolerance, 2) + "°C\n";
           message += "⚠️ *Порог тревоги:* " + String(alertThreshold, 2) + "°C\n";
-          message += "⏱️ *Время наблюдения:* " + String(durationMin) + " мин";
+          message += "⏱️ *Длительность:* " + String(duration) + "с (" + String(duration / 60) + " мин)";
           sendTelegramMessageToQueue(chat_id, message);
         }
       }
@@ -925,21 +841,19 @@ void handleTelegramMessages() {
     } else if (command == "/stab_get" || command == "stab_get") {
       StabilizationModeSettings stab = getStabilizationSettings();
       String message = "🎯 *Настройки стабилизации*\n\n";
-      message += "📏 *Допуск колебаний:* ±" + String(stab.tolerance, 2) + "°C\n";
+      message += "📌 *Целевая температура:* " + String(stab.targetTemp, 1) + "°C\n";
+      message += "📏 *Допуск:* ±" + String(stab.tolerance, 2) + "°C\n";
       message += "⚠️ *Порог тревоги:* " + String(stab.alertThreshold, 2) + "°C\n";
-      message += "⏱️ *Время наблюдения:* " + String(stab.duration / 60) + " мин";
-
+      message += "⏱️ *Длительность:* " + String(stab.duration) + "с (" + String(stab.duration / 60) + " мин)";
+      
       if (getOperationMode() == MODE_STABILIZATION) {
-        message += "\n\n📊 *Статус:*\n";
+        message += "\n\n📊 *Статус стабилизации:*\n";
+        message += "   Стабилизировано: " + String(isStabilized() ? "✅ Да" : "❌ Нет") + "\n";
         if (isStabilized()) {
-          message += "   ✅ Стабилизировано\n";
-          message += "   🌡️ Температура: " + String(getStabilizedTemp(), 1) + "°C";
-        } else {
-          message += "   🔍 Отслеживание\n";
-          message += "   ⏱️ Прошло: " + String(getStabilizationTime()) + " сек";
+          message += "   Время: " + String(getStabilizationTime()) + "с";
         }
       }
-
+      
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command == "/display_on" || command == "display_on") {
@@ -977,441 +891,7 @@ void handleTelegramMessages() {
       sendTelegramMessageToQueue(chat_id, message);
       delay(2000); // Даем время на отправку сообщения
       ESP.restart();
-
-    } else if (command == "/sensor_list" || command == "sensor_list") {
-      // Список всех термометров с их настройками
-      String message = "🌡️ *Список термометров*\n\n";
-
-      int sensorCount = getSensorCount();
-      if (sensorCount == 0) {
-        message += "❌ Термометры не обнаружены";
-      } else {
-        for (int i = 0; i < sensorCount; i++) {
-          String addressStr = getSensorAddressString(i);
-          float temp = getSensorTemperature(i);
-
-          message += "*" + String(i + 1) + ".* ";
-
-          // Ищем настройки в кеше
-          String name = "Термометр " + String(i + 1);
-          String mode = "monitoring";
-          bool enabled = true;
-          float correction = 0.0;
-
-          for (int j = 0; j < sensorConfigCount; j++) {
-            if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
-              name = sensorConfigs[j].name;
-              mode = sensorConfigs[j].mode;
-              enabled = sensorConfigs[j].enabled;
-              correction = sensorConfigs[j].correction;
-              break;
-            }
-          }
-
-          message += name + "\n";
-          message += "   🌡️ " + String(temp != -127.0 ? String(temp + correction, 1) + "°C" : "Ошибка") + "\n";
-          message += "   ⚙️ Режим: ";
-          if (mode == "monitoring") message += "Мониторинг";
-          else if (mode == "alert") message += "Оповещение";
-          else if (mode == "stabilization") message += "Стабилизация";
-          else message += mode;
-          message += "\n";
-          message += "   ✅ " + String(enabled ? "Включен" : "Выключен") + "\n\n";
-        }
-
-        message += "💡 Используйте `/sensor_mode <n> <режим>` для изменения режима";
-      }
-
-      sendTelegramMessageToQueue(chat_id, message);
-
-    } else if (command.startsWith("/sensor_mode") || command == "sensor_mode") {
-      // Установка режима термометра: /sensor_mode <n> <режим>
-      int firstSpace = text.indexOf(' ');
-      if (firstSpace == -1) {
-        String message = "❌ *Ошибка формата*\n\n";
-        message += "Использование: `/sensor_mode <n> <режим>`\n";
-        message += "Пример: `/sensor_mode 1 alert`\n\n";
-        message += "Режимы:\n";
-        message += "  `monitoring` - мониторинг\n";
-        message += "  `alert` - оповещение\n";
-        message += "  `stabilization` - стабилизация";
-        sendTelegramMessageToQueue(chat_id, message);
-      } else {
-        String params = text.substring(firstSpace + 1);
-        int secondSpace = params.indexOf(' ');
-
-        if (secondSpace == -1) {
-          String message = "❌ *Ошибка формата*\n\n";
-          message += "Использование: `/sensor_mode <n> <режим>`";
-          sendTelegramMessageToQueue(chat_id, message);
-        } else {
-          int sensorNum = params.substring(0, secondSpace).toInt();
-          String newMode = params.substring(secondSpace + 1);
-          newMode.trim();
-          newMode.toLowerCase();
-
-          int sensorCount = getSensorCount();
-          if (sensorNum < 1 || sensorNum > sensorCount) {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Термометр #" + String(sensorNum) + " не найден.\n";
-            message += "Доступно термометров: " + String(sensorCount);
-            sendTelegramMessageToQueue(chat_id, message);
-          } else if (newMode != "monitoring" && newMode != "alert" && newMode != "stabilization") {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Неизвестный режим: `" + newMode + "`\n\n";
-            message += "Доступные режимы:\n";
-            message += "  `monitoring` - мониторинг\n";
-            message += "  `alert` - оповещение\n";
-            message += "  `stabilization` - стабилизация";
-            sendTelegramMessageToQueue(chat_id, message);
-          } else {
-            // Обновляем настройки
-            String addressStr = getSensorAddressString(sensorNum - 1);
-            String settingsJson = getSettings();
-            StaticJsonDocument<4096> doc;
-            DeserializationError error = deserializeJson(doc, settingsJson);
-
-            if (error) {
-              String message = "❌ *Ошибка*\n\n";
-              message += "Не удалось загрузить настройки";
-              sendTelegramMessageToQueue(chat_id, message);
-            } else {
-              JsonArray sensors = doc["sensors"].as<JsonArray>();
-              bool found = false;
-
-              for (JsonObject sensor : sensors) {
-                if (sensor["address"].as<String>() == addressStr) {
-                  sensor["mode"] = newMode;
-                  found = true;
-                  break;
-                }
-              }
-
-              if (!found) {
-                // Добавляем новый объект настроек
-                JsonObject newSensor = sensors.createNestedObject();
-                newSensor["address"] = addressStr;
-                newSensor["name"] = "Термометр " + String(sensorNum);
-                newSensor["mode"] = newMode;
-                newSensor["enabled"] = true;
-                newSensor["correction"] = 0.0;
-                newSensor["sendToNetworks"] = true;
-              }
-
-              String newJson;
-              serializeJson(doc, newJson);
-
-              if (saveSettings(newJson)) {
-                forceReloadSettings = true;
-                loadSensorConfigs();
-
-                String message = "✅ *Режим изменен*\n\n";
-                message += "🌡️ Термометр #" + String(sensorNum) + "\n";
-                message += "⚙️ Новый режим: ";
-                if (newMode == "monitoring") message += "Мониторинг";
-                else if (newMode == "alert") message += "Оповещение";
-                else if (newMode == "stabilization") message += "Стабилизация";
-                sendTelegramMessageToQueue(chat_id, message);
-              } else {
-                String message = "❌ *Ошибка*\n\n";
-                message += "Не удалось сохранить настройки";
-                sendTelegramMessageToQueue(chat_id, message);
-              }
-            }
-          }
-        }
-      }
-
-    } else if (command.startsWith("/sensor_alert") || command == "sensor_alert") {
-      // Установка порогов оповещения: /sensor_alert <n> <min> <max>
-      int firstSpace = text.indexOf(' ');
-      if (firstSpace == -1) {
-        String message = "❌ *Ошибка формата*\n\n";
-        message += "Использование: `/sensor_alert <n> <min> <max>`\n";
-        message += "Пример: `/sensor_alert 1 10 30`\n\n";
-        message += "Устанавливает пороги температуры для режима оповещения";
-        sendTelegramMessageToQueue(chat_id, message);
-      } else {
-        String params = text.substring(firstSpace + 1);
-        int spaces[2] = {-1, -1};
-        int spaceCount = 0;
-        for (unsigned int i = 0; i < params.length() && spaceCount < 2; i++) {
-          if (params.charAt(i) == ' ') {
-            spaces[spaceCount] = i;
-            spaceCount++;
-          }
-        }
-
-        if (spaceCount < 2) {
-          String message = "❌ *Ошибка формата*\n\n";
-          message += "Использование: `/sensor_alert <n> <min> <max>`";
-          sendTelegramMessageToQueue(chat_id, message);
-        } else {
-          int sensorNum = params.substring(0, spaces[0]).toInt();
-          float minTemp = params.substring(spaces[0] + 1, spaces[1]).toFloat();
-          float maxTemp = params.substring(spaces[1] + 1).toFloat();
-
-          int sensorCount = getSensorCount();
-          if (sensorNum < 1 || sensorNum > sensorCount) {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Термометр #" + String(sensorNum) + " не найден.\n";
-            message += "Доступно термометров: " + String(sensorCount);
-            sendTelegramMessageToQueue(chat_id, message);
-          } else if (minTemp >= maxTemp) {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Минимальная температура должна быть меньше максимальной!";
-            sendTelegramMessageToQueue(chat_id, message);
-          } else {
-            // Обновляем настройки
-            String addressStr = getSensorAddressString(sensorNum - 1);
-            String settingsJson = getSettings();
-            StaticJsonDocument<4096> doc;
-            DeserializationError error = deserializeJson(doc, settingsJson);
-
-            if (error) {
-              String message = "❌ *Ошибка*\n\n";
-              message += "Не удалось загрузить настройки";
-              sendTelegramMessageToQueue(chat_id, message);
-            } else {
-              JsonArray sensors = doc["sensors"].as<JsonArray>();
-              bool found = false;
-
-              for (JsonObject sensor : sensors) {
-                if (sensor["address"].as<String>() == addressStr) {
-                  sensor["alertMinTemp"] = minTemp;
-                  sensor["alertMaxTemp"] = maxTemp;
-                  found = true;
-                  break;
-                }
-              }
-
-              if (!found) {
-                // Добавляем новый объект настроек
-                JsonObject newSensor = sensors.createNestedObject();
-                newSensor["address"] = addressStr;
-                newSensor["name"] = "Термометр " + String(sensorNum);
-                newSensor["mode"] = "alert";
-                newSensor["enabled"] = true;
-                newSensor["correction"] = 0.0;
-                newSensor["sendToNetworks"] = true;
-                newSensor["alertMinTemp"] = minTemp;
-                newSensor["alertMaxTemp"] = maxTemp;
-              }
-
-              String newJson;
-              serializeJson(doc, newJson);
-
-              if (saveSettings(newJson)) {
-                forceReloadSettings = true;
-                loadSensorConfigs();
-
-                String message = "✅ *Пороги оповещения установлены*\n\n";
-                message += "🌡️ Термометр #" + String(sensorNum) + "\n";
-                message += "📉 Минимум: " + String(minTemp, 1) + "°C\n";
-                message += "📈 Максимум: " + String(maxTemp, 1) + "°C";
-                sendTelegramMessageToQueue(chat_id, message);
-              } else {
-                String message = "❌ *Ошибка*\n\n";
-                message += "Не удалось сохранить настройки";
-                sendTelegramMessageToQueue(chat_id, message);
-              }
-            }
-          }
-        }
-      }
-
-    } else if (command.startsWith("/sensor_stab") || command == "sensor_stab") {
-      // Установка настроек стабилизации: /sensor_stab <n> <tol> <alert> <min>
-      int firstSpace = text.indexOf(' ');
-      if (firstSpace == -1) {
-        String message = "❌ *Ошибка формата*\n\n";
-        message += "Использование: `/sensor_stab <n> <tol> <alert> <min>`\n";
-        message += "Пример: `/sensor_stab 1 0.1 0.2 10`\n\n";
-        message += "Параметры:\n";
-        message += "  n - номер термометра\n";
-        message += "  tol - допуск колебаний (°C)\n";
-        message += "  alert - порог тревоги (°C)\n";
-        message += "  min - время наблюдения (минуты)";
-        sendTelegramMessageToQueue(chat_id, message);
-      } else {
-        String params = text.substring(firstSpace + 1);
-        int spaces[3] = {-1, -1, -1};
-        int spaceCount = 0;
-        for (unsigned int i = 0; i < params.length() && spaceCount < 3; i++) {
-          if (params.charAt(i) == ' ') {
-            spaces[spaceCount] = i;
-            spaceCount++;
-          }
-        }
-
-        if (spaceCount < 3) {
-          String message = "❌ *Ошибка формата*\n\n";
-          message += "Использование: `/sensor_stab <n> <tol> <alert> <min>`";
-          sendTelegramMessageToQueue(chat_id, message);
-        } else {
-          int sensorNum = params.substring(0, spaces[0]).toInt();
-          float tolerance = params.substring(spaces[0] + 1, spaces[1]).toFloat();
-          float alertThreshold = params.substring(spaces[1] + 1, spaces[2]).toFloat();
-          int durationMin = params.substring(spaces[2] + 1).toInt();
-
-          int sensorCount = getSensorCount();
-          if (sensorNum < 1 || sensorNum > sensorCount) {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Термометр #" + String(sensorNum) + " не найден.\n";
-            message += "Доступно термометров: " + String(sensorCount);
-            sendTelegramMessageToQueue(chat_id, message);
-          } else if (tolerance <= 0 || alertThreshold <= 0 || durationMin <= 0) {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Все параметры должны быть положительными числами!";
-            sendTelegramMessageToQueue(chat_id, message);
-          } else {
-            // Обновляем настройки
-            String addressStr = getSensorAddressString(sensorNum - 1);
-            String settingsJson = getSettings();
-            StaticJsonDocument<4096> doc;
-            DeserializationError error = deserializeJson(doc, settingsJson);
-
-            if (error) {
-              String message = "❌ *Ошибка*\n\n";
-              message += "Не удалось загрузить настройки";
-              sendTelegramMessageToQueue(chat_id, message);
-            } else {
-              JsonArray sensors = doc["sensors"].as<JsonArray>();
-              bool found = false;
-
-              for (JsonObject sensor : sensors) {
-                if (sensor["address"].as<String>() == addressStr) {
-                  sensor["stabTolerance"] = tolerance;
-                  sensor["stabAlertThreshold"] = alertThreshold;
-                  sensor["stabDuration"] = durationMin * 60; // Конвертируем в секунды
-                  found = true;
-                  break;
-                }
-              }
-
-              if (!found) {
-                // Добавляем новый объект настроек
-                JsonObject newSensor = sensors.createNestedObject();
-                newSensor["address"] = addressStr;
-                newSensor["name"] = "Термометр " + String(sensorNum);
-                newSensor["mode"] = "stabilization";
-                newSensor["enabled"] = true;
-                newSensor["correction"] = 0.0;
-                newSensor["sendToNetworks"] = true;
-                newSensor["stabTolerance"] = tolerance;
-                newSensor["stabAlertThreshold"] = alertThreshold;
-                newSensor["stabDuration"] = durationMin * 60;
-              }
-
-              String newJson;
-              serializeJson(doc, newJson);
-
-              if (saveSettings(newJson)) {
-                forceReloadSettings = true;
-                loadSensorConfigs();
-
-                String message = "✅ *Настройки стабилизации установлены*\n\n";
-                message += "🌡️ Термометр #" + String(sensorNum) + "\n";
-                message += "📏 Допуск: ±" + String(tolerance, 2) + "°C\n";
-                message += "⚠️ Порог тревоги: " + String(alertThreshold, 2) + "°C\n";
-                message += "⏱️ Время: " + String(durationMin) + " мин";
-                sendTelegramMessageToQueue(chat_id, message);
-              } else {
-                String message = "❌ *Ошибка*\n\n";
-                message += "Не удалось сохранить настройки";
-                sendTelegramMessageToQueue(chat_id, message);
-              }
-            }
-          }
-        }
-      }
-
-    } else if (command.startsWith("/sensor_name") || command == "sensor_name") {
-      // Установка имени термометра: /sensor_name <n> <name>
-      int firstSpace = text.indexOf(' ');
-      if (firstSpace == -1) {
-        String message = "❌ *Ошибка формата*\n\n";
-        message += "Использование: `/sensor_name <n> <имя>`\n";
-        message += "Пример: `/sensor_name 1 Холодильник`";
-        sendTelegramMessageToQueue(chat_id, message);
-      } else {
-        String params = text.substring(firstSpace + 1);
-        int secondSpace = params.indexOf(' ');
-
-        if (secondSpace == -1) {
-          String message = "❌ *Ошибка формата*\n\n";
-          message += "Использование: `/sensor_name <n> <имя>`";
-          sendTelegramMessageToQueue(chat_id, message);
-        } else {
-          int sensorNum = params.substring(0, secondSpace).toInt();
-          String newName = params.substring(secondSpace + 1);
-          newName.trim();
-
-          int sensorCount = getSensorCount();
-          if (sensorNum < 1 || sensorNum > sensorCount) {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Термометр #" + String(sensorNum) + " не найден.\n";
-            message += "Доступно термометров: " + String(sensorCount);
-            sendTelegramMessageToQueue(chat_id, message);
-          } else if (newName.length() == 0 || newName.length() > 32) {
-            String message = "❌ *Ошибка*\n\n";
-            message += "Имя должно быть от 1 до 32 символов";
-            sendTelegramMessageToQueue(chat_id, message);
-          } else {
-            // Обновляем настройки
-            String addressStr = getSensorAddressString(sensorNum - 1);
-            String settingsJson = getSettings();
-            StaticJsonDocument<4096> doc;
-            DeserializationError error = deserializeJson(doc, settingsJson);
-
-            if (error) {
-              String message = "❌ *Ошибка*\n\n";
-              message += "Не удалось загрузить настройки";
-              sendTelegramMessageToQueue(chat_id, message);
-            } else {
-              JsonArray sensors = doc["sensors"].as<JsonArray>();
-              bool found = false;
-
-              for (JsonObject sensor : sensors) {
-                if (sensor["address"].as<String>() == addressStr) {
-                  sensor["name"] = newName;
-                  found = true;
-                  break;
-                }
-              }
-
-              if (!found) {
-                // Добавляем новый объект настроек
-                JsonObject newSensor = sensors.createNestedObject();
-                newSensor["address"] = addressStr;
-                newSensor["name"] = newName;
-                newSensor["mode"] = "monitoring";
-                newSensor["enabled"] = true;
-                newSensor["correction"] = 0.0;
-                newSensor["sendToNetworks"] = true;
-              }
-
-              String newJson;
-              serializeJson(doc, newJson);
-
-              if (saveSettings(newJson)) {
-                forceReloadSettings = true;
-                loadSensorConfigs();
-
-                String message = "✅ *Имя изменено*\n\n";
-                message += "🌡️ Термометр #" + String(sensorNum) + "\n";
-                message += "📝 Новое имя: " + newName;
-                sendTelegramMessageToQueue(chat_id, message);
-              } else {
-                String message = "❌ *Ошибка*\n\n";
-                message += "Не удалось сохранить настройки";
-                sendTelegramMessageToQueue(chat_id, message);
-              }
-            }
-          }
-        }
-      }
-
+      
     } else {
       // Неизвестная команда
       String message = "❓ Неизвестная команда: `" + command + "`\n\n";
@@ -1585,10 +1065,7 @@ void setTelegramConfig(const String& token, const String& chatId) {
   telegramBotToken = token;
   telegramChatId = chatId;
   updateTelegramFlags();
-  
-  // НЕ вызываем ensureTelegramBot() здесь - это может блокировать при сохранении настроек
-  // Бот будет инициализирован автоматически при следующей попытке отправки сообщения
-  // Это предотвращает блокировку при сохранении настроек, особенно если WiFi нестабилен
+  ensureTelegramBot();
   
   Serial.print(F("Telegram config set: token="));
   Serial.print(telegramBotToken.length() > 0 ? "***" : "(empty)");
@@ -1598,14 +1075,6 @@ void setTelegramConfig(const String& token, const String& chatId) {
   Serial.print(telegramConfigured);
   Serial.print(F(", canSend="));
   Serial.println(telegramCanSend);
-  
-  // Сбрасываем инициализацию бота, чтобы он пересоздался при следующей отправке
-  telegramInitialized = false;
-  if (bot) {
-    delete bot;
-    bot = nullptr;
-  }
-  telegramActiveToken = "";
 }
 
 bool isTelegramConfigured() {

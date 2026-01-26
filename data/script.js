@@ -35,6 +35,11 @@ function formatTime(date) {
 async function fetchData() {
     try {
         const response = await fetch(API_ENDPOINT);
+        if (response.status === 401) {
+            // Не авторизован - редирект на логин
+            window.location.href = '/login.html';
+            return;
+        }
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -156,6 +161,7 @@ async function loadSensors() {
                     buzzerEnabled: true
                 },
                 stabilizationSettings: {
+                    targetTemp: 25.0,
                     tolerance: 0.1,
                     alertThreshold: 0.2,
                     duration: 10,
@@ -178,7 +184,7 @@ async function loadSensors() {
             sendToNetworks: true,
             buzzerEnabled: false,
             alertSettings: { minTemp: 10.0, maxTemp: 30.0, buzzerEnabled: true },
-            stabilizationSettings: { tolerance: 0.1, alertThreshold: 0.2, duration: 10, buzzerEnabled: true }
+            stabilizationSettings: { targetTemp: 25.0, tolerance: 0.1, alertThreshold: 0.2, duration: 10, buzzerEnabled: true }
         }];
         renderSensorCells();
         updateChartSensorSelectors();
@@ -227,20 +233,16 @@ function renderSensorCells() {
                 </div>
             `;
         } else if (sensor.mode === 'stabilization' && sensor.stabilizationSettings) {
-            const isStabilized = sensorData.isStabilized || false;
-            const stabilizedTemp = sensorData.stabilizedTemp || 0;
-            const state = isStabilized ? 'stabilized' : 'tracking';
             const stateNames = {
-                'stabilized': '✅ Стабильно',
-                'tracking': '🔍 Отслеживание'
+                'heating': 'Нагрев',
+                'cooling': 'Охлаждение',
+                'tracking': 'Отслеживание'
             };
-            const stateInfo = isStabilized
-                ? `${stabilizedTemp.toFixed(1)}°C ±${sensor.stabilizationSettings.alertThreshold}°C`
-                : `±${sensor.stabilizationSettings.tolerance}°C / ${sensor.stabilizationSettings.duration} мин`;
+            const state = sensorData.stabilizationState || 'tracking';
             modeDataHtml = `
                 <div class="sensor-data">
                     <span class="stabilization-state">${stateNames[state]}</span>
-                    <span class="stabilization-threshold">${stateInfo}</span>
+                    <span class="stabilization-threshold">Порог: ${sensor.stabilizationSettings.alertThreshold}°C</span>
                 </div>
             `;
         }
@@ -307,24 +309,16 @@ function openSensorSettings(sensorId) {
     
     // Настройки стабилизации
     if (sensor.stabilizationSettings) {
+        document.getElementById('modal-stab-target-temp').value = sensor.stabilizationSettings.targetTemp || 25.0;
         document.getElementById('modal-stab-tolerance').value = sensor.stabilizationSettings.tolerance || 0.1;
         document.getElementById('modal-stab-alert-threshold').value = sensor.stabilizationSettings.alertThreshold || 0.2;
         document.getElementById('modal-stab-duration').value = sensor.stabilizationSettings.duration || 10;
     }
     
     // Настройки мониторинга
-    const monitoringThresholdInput = document.getElementById('modal-monitoring-threshold');
-    if (monitoringThresholdInput) {
-        // Обратная совместимость: если есть старый monitoringInterval, конвертируем
-        if (sensor.monitoringThreshold !== undefined) {
-            monitoringThresholdInput.value = sensor.monitoringThreshold || 1.0;
-        } else if (sensor.monitoringInterval !== undefined) {
-            // Конвертируем старый интервал в уставку (примерная оценка)
-            const oldInterval = sensor.monitoringInterval || 5;
-            monitoringThresholdInput.value = (oldInterval <= 5) ? 0.5 : 1.0;
-        } else {
-            monitoringThresholdInput.value = 1.0;
-        }
+    const monitoringIntervalInput = document.getElementById('modal-monitoring-interval');
+    if (monitoringIntervalInput) {
+        monitoringIntervalInput.value = sensor.monitoringInterval || 5;
     }
     
     // Обновляем видимость настроек режима
@@ -352,32 +346,6 @@ function updateSensorModeSettings(mode) {
     if (stabSettings) stabSettings.style.display = (mode === 'stabilization') ? 'block' : 'none';
 }
 
-// Функция polling статуса сохранения
-async function waitForSaveComplete(maxAttempts = 20, intervalMs = 500) {
-    for (let i = 0; i < maxAttempts; i++) {
-        try {
-            const response = await fetch('/api/settings/status');
-            if (!response.ok) {
-                // Если эндпоинт не существует, считаем успешным
-                return { success: true, message: 'Settings saved' };
-            }
-            const status = await response.json();
-
-            if (status.status === 'success' || status.status === 'idle') {
-                return { success: true, message: status.message };
-            } else if (status.status === 'error') {
-                return { success: false, message: status.message };
-            }
-            // status === 'saving' - продолжаем ждать
-            await new Promise(resolve => setTimeout(resolve, intervalMs));
-        } catch (error) {
-            console.error('Error checking save status:', error);
-            return { success: true, message: 'Settings saved' };
-        }
-    }
-    return { success: false, message: 'Save timeout' };
-}
-
 // Сохранение настроек термометра
 async function saveSensorSettings() {
     const sensorKey = document.getElementById('modal-sensor-id').value;
@@ -387,7 +355,7 @@ async function saveSensorSettings() {
         console.error('Sensor not found:', sensorKey);
         return;
     }
-
+    
     // Обновляем данные термометра
     const nameInput = document.getElementById('modal-sensor-name-input');
     if (nameInput && nameInput.value.trim()) {
@@ -395,41 +363,42 @@ async function saveSensorSettings() {
     }
     sensor.mode = document.getElementById('modal-sensor-mode').value;
     sensor.sendToNetworks = document.getElementById('modal-send-to-networks').checked;
-
+    
     // Настройки мониторинга
     if (sensor.mode === 'monitoring') {
-        const monitoringThresholdInput = document.getElementById('modal-monitoring-threshold');
-        if (monitoringThresholdInput) {
-            sensor.monitoringThreshold = parseFloat(monitoringThresholdInput.value) || 1.0;
+        const monitoringIntervalInput = document.getElementById('modal-monitoring-interval');
+        if (monitoringIntervalInput) {
+            sensor.monitoringInterval = parseInt(monitoringIntervalInput.value) || 5;
         } else {
-            sensor.monitoringThreshold = 1.0;
+            sensor.monitoringInterval = 5;
         }
     }
-
+    
     if (sensor.mode === 'alert') {
         if (!sensor.alertSettings) sensor.alertSettings = {};
         sensor.alertSettings.minTemp = parseFloat(document.getElementById('modal-alert-min-temp').value) || 10.0;
         sensor.alertSettings.maxTemp = parseFloat(document.getElementById('modal-alert-max-temp').value) || 30.0;
         sensor.alertSettings.buzzerEnabled = document.getElementById('modal-alert-buzzer').checked;
     }
-
+    
     if (sensor.mode === 'stabilization') {
         if (!sensor.stabilizationSettings) sensor.stabilizationSettings = {};
+        sensor.stabilizationSettings.targetTemp = parseFloat(document.getElementById('modal-stab-target-temp').value) || 25.0;
         sensor.stabilizationSettings.tolerance = parseFloat(document.getElementById('modal-stab-tolerance').value) || 0.1;
         sensor.stabilizationSettings.alertThreshold = parseFloat(document.getElementById('modal-stab-alert-threshold').value) || 0.2;
         sensor.stabilizationSettings.duration = parseInt(document.getElementById('modal-stab-duration').value) || 10;
     }
-
+    
     // Сохраняем на сервер через общий API датчиков
     try {
-        // Подготавливаем данные для сохранения
+        // Подготавливаем данные для сохранения - убеждаемся, что все поля присутствуют
         const sensorsToSave = sensors.map(s => ({
             address: s.address || '',
             name: s.name || '',
             enabled: s.enabled !== undefined ? s.enabled : true,
             correction: s.correction || 0.0,
             mode: s.mode || 'monitoring',
-            monitoringThreshold: s.monitoringThreshold !== undefined ? s.monitoringThreshold : 1.0,
+            monitoringInterval: s.monitoringInterval || 5,
             sendToNetworks: s.sendToNetworks !== undefined ? s.sendToNetworks : true,
             buzzerEnabled: s.buzzerEnabled || false,
             alertSettings: s.alertSettings || {
@@ -438,139 +407,82 @@ async function saveSensorSettings() {
                 buzzerEnabled: true
             },
             stabilizationSettings: s.stabilizationSettings || {
+                targetTemp: 25.0,
                 tolerance: 0.1,
                 alertThreshold: 0.2,
                 duration: 10
             }
         }));
-
-        // Сохраняем все датчики с таймаутом
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000);
-
+        
+        // Сохраняем все датчики
         const response = await fetch('/api/sensors', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ sensors: sensorsToSave }),
-            signal: controller.signal
+            body: JSON.stringify({ sensors: sensorsToSave })
         });
-
-        clearTimeout(timeoutId);
-
-        if (response.status === 503) {
-            alert('Сервер занят. Попробуйте через несколько секунд.');
-            return;
-        }
-
+        
         if (response.ok) {
-            // Ждём небольшую задержку для завершения записи на сервере
-            await new Promise(resolve => setTimeout(resolve, 500));
-
             // Перезагружаем данные датчиков с сервера
             await loadSensors();
             // Обновляем отображение на главном экране
             renderSensorCells();
             // Закрываем модальное окно
             closeSensorSettings();
+            // Показываем сообщение об успехе
             console.log('Настройки термометра сохранены');
         } else {
-            let errorMsg = 'Ошибка сохранения настроек';
-            try {
-                const errorData = await response.json();
-                if (errorData.message || errorData.error) {
-                    errorMsg = errorData.message || errorData.error;
-                }
-            } catch (e) {}
-            alert(errorMsg);
+            alert('Ошибка сохранения настроек');
         }
     } catch (error) {
         console.error('Error saving sensor settings:', error);
-        if (error.name === 'AbortError') {
-            alert('Таймаут при сохранении. Попробуйте еще раз.');
-        } else {
-            alert('Ошибка сохранения настроек: ' + error.message);
-        }
+        alert('Ошибка сохранения настроек');
     }
 }
 
 // Переключение отправки данных
-async function toggleSendToNetworks(sensorId) {
+function toggleSendToNetworks(sensorId) {
     // Ищем по адресу, индексу или id
     const sensor = sensors.find(s => (s.address === sensorId || s.index === sensorId || s.id === sensorId));
     if (!sensor) return;
-
-    const previousValue = sensor.sendToNetworks;
+    
     sensor.sendToNetworks = !sensor.sendToNetworks;
-
-    // Обновляем UI сразу для отзывчивости
-    renderSensorCells();
-
+    
     // Сохраняем на сервер
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-        const response = await fetch('/api/sensors', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ sensors: sensors }),
-            signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-            throw new Error('Server error');
-        }
-    } catch (error) {
+    fetch('/api/sensors', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ sensors: sensors })
+    }).catch(error => {
         console.error('Error saving sensor:', error);
-        // Откатываем изменение при ошибке
-        sensor.sendToNetworks = previousValue;
-        renderSensorCells();
-    }
+    });
+    
+    renderSensorCells();
 }
 
 // Переключение бипера
-async function toggleBuzzer(sensorId) {
+function toggleBuzzer(sensorId) {
     // Ищем по адресу, индексу или id
     const sensor = sensors.find(s => (s.address === sensorId || s.index === sensorId || s.id === sensorId));
     if (!sensor) return;
-
-    const previousValue = sensor.buzzerEnabled;
+    
     sensor.buzzerEnabled = !sensor.buzzerEnabled;
-
-    // Обновляем UI сразу для отзывчивости
-    renderSensorCells();
-
+    
     // Сохраняем на сервер
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-        const response = await fetch('/api/sensors', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ sensors: sensors }),
-            signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-            throw new Error('Server error');
-        }
-    } catch (error) {
+    fetch('/api/sensors', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ sensors: sensors })
+    }).catch(error => {
         console.error('Error saving sensor:', error);
-        // Откатываем изменение при ошибке
-        sensor.buzzerEnabled = previousValue;
-        renderSensorCells();
-    }
+    });
+    
+    renderSensorCells();
 }
 
 // Закрытие модального окна по клику на overlay
@@ -663,15 +575,15 @@ function updateChartSensorSelectors() {
 // Функция определения интервала агрегации данных в зависимости от периода
 function getAggregationInterval(period) {
     switch(period) {
-        case '1m': return 10; // 10 секунд для 1 минуты (показываем все точки)
-        case '5m': return 30; // 30 секунд для 5 минут (показываем все точки)
-        case '15m': return 60; // 1 минута для 15 минут
-        case '30m': return 120; // 2 минуты для 30 минут
-        case '1h': return 300; // 5 минут для 1 часа
-        case '6h': return 1800; // 30 минут для 6 часов
-        case '24h': return 3600; // 1 час для 24 часов
-        case '7d': return 21600; // 6 часов для 7 дней
-        default: return 300; // По умолчанию 5 минут
+        case '1m': return 60; // 1 минута
+        case '5m': return 300; // 5 минут
+        case '15m': return 900; // 15 минут
+        case '30m': return 1800; // 30 минут
+        case '1h': return 3600; // 1 час
+        case '6h': return 21600; // 6 часов
+        case '24h': return 86400; // 24 часа
+        case '7d': return 604800; // 7 дней
+        default: return 3600; // По умолчанию 1 час
     }
 }
 
@@ -679,36 +591,11 @@ function getAggregationInterval(period) {
 function aggregateData(records, intervalSeconds) {
     if (!records || records.length === 0) return [];
     
-    // Сортируем записи по времени (на случай, если они пришли не в хронологическом порядке)
-    const sortedRecords = [...records].sort((a, b) => a.timestamp - b.timestamp);
-    
-    // Для очень коротких интервалов (меньше 5 минут) не агрегируем, показываем все точки
-    if (intervalSeconds < 300) {
-        return sortedRecords.map(record => {
-            const result = {
-                timestamp: record.timestamp,
-                sensors: {}
-            };
-            
-            if (record.temperature !== null && 
-                record.temperature !== undefined && 
-                record.temperature !== 0 && 
-                record.temperature !== -127.0) {
-                const sensorKey = record.sensor_id || record.sensor_address || 'default';
-                result.sensors[sensorKey] = record.temperature;
-                result.average = record.temperature;
-            }
-            
-            return result;
-        });
-    }
-    
-    // Для более длинных интервалов агрегируем данные
     const aggregated = [];
     let currentBucket = null;
     let bucketStartTime = null;
     
-    sortedRecords.forEach(record => {
+    records.forEach(record => {
         const recordTime = record.timestamp;
         
         // Определяем начало текущего бакета
@@ -1014,6 +901,36 @@ function resetChartZoom() {
 }
 
 // Функция инициализации
+// Загрузка отладочной информации (версия, память)
+async function loadDebugInfo() {
+    try {
+        const response = await fetch('/api/debug');
+        if (!response.ok) return;
+        const data = await response.json();
+
+        // Версия прошивки
+        const versionEl = document.getElementById('firmware-version');
+        if (versionEl && data.firmware) {
+            versionEl.textContent = 'v' + data.firmware.version;
+        }
+
+        // Использование Heap
+        const heapEl = document.getElementById('heap-usage');
+        if (heapEl && data.heap) {
+            heapEl.textContent = data.heap.usage + '%';
+        }
+
+        // Использование SPIFFS
+        const spiffsEl = document.getElementById('spiffs-usage');
+        if (spiffsEl && data.spiffs) {
+            const usage = Math.round(data.spiffs.used * 100 / data.spiffs.total);
+            spiffsEl.textContent = usage + '%';
+        }
+    } catch (e) {
+        console.warn('Failed to load debug info:', e);
+    }
+}
+
 async function init() {
     // Сначала загружаем список термометров и ждём завершения
     // Это критически важно - без списка сенсоров плитки не отрисуются
@@ -1021,6 +938,9 @@ async function init() {
 
     // Теперь загружаем данные (температуры, статусы)
     await fetchData();
+
+    // Загружаем информацию о системе
+    loadDebugInfo();
 
     // Загрузка графика (только если Chart.js доступен)
     if (typeof Chart !== 'undefined') {
