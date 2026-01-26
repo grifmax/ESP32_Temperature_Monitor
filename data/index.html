@@ -5,8 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP32 Temperature Monitor</title>
     <link rel="stylesheet" href="style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <!-- Chart.js загружается локально (работает без интернета) -->
+    <script src="chart.min.js"></script>
+    <script src="chartjs-plugin-zoom.min.js"></script>
     <script>
         // Регистрируем плагин масштабирования глобально для Chart.js v4
         if (typeof Chart !== 'undefined') {
