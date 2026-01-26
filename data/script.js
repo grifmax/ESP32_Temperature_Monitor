@@ -896,6 +896,36 @@ function resetChartZoom() {
 }
 
 // Функция инициализации
+// Загрузка отладочной информации (версия, память)
+async function loadDebugInfo() {
+    try {
+        const response = await fetch('/api/debug');
+        if (!response.ok) return;
+        const data = await response.json();
+
+        // Версия прошивки
+        const versionEl = document.getElementById('firmware-version');
+        if (versionEl && data.firmware) {
+            versionEl.textContent = 'v' + data.firmware.version;
+        }
+
+        // Использование Heap
+        const heapEl = document.getElementById('heap-usage');
+        if (heapEl && data.heap) {
+            heapEl.textContent = data.heap.usage + '%';
+        }
+
+        // Использование SPIFFS
+        const spiffsEl = document.getElementById('spiffs-usage');
+        if (spiffsEl && data.spiffs) {
+            const usage = Math.round(data.spiffs.used * 100 / data.spiffs.total);
+            spiffsEl.textContent = usage + '%';
+        }
+    } catch (e) {
+        console.warn('Failed to load debug info:', e);
+    }
+}
+
 async function init() {
     // Сначала загружаем список термометров и ждём завершения
     // Это критически важно - без списка сенсоров плитки не отрисуются
@@ -903,6 +933,9 @@ async function init() {
 
     // Теперь загружаем данные (температуры, статусы)
     await fetchData();
+
+    // Загружаем информацию о системе
+    loadDebugInfo();
 
     // Загрузка графика (только если Chart.js доступен)
     if (typeof Chart !== 'undefined') {
