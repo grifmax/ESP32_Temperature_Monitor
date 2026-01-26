@@ -478,32 +478,36 @@ void loadSensorConfigs() {
       config.name = nameStr;
     }
     config.enabled = sensor["enabled"] | true;
-    config.correction = sensor["correction"] | 0.0;
+    // Валидация: коррекция в пределах -10..+10 градусов
+    config.correction = constrain((float)(sensor["correction"] | 0.0), -10.0f, 10.0f);
     String modeStr = sensor["mode"] | "monitoring";
     config.mode = modeStr;
     config.sendToNetworks = sensor["sendToNetworks"] | true;
     config.buzzerEnabled = sensor["buzzerEnabled"] | false;
-    config.monitoringInterval = sensor["monitoringInterval"] | 5; // По умолчанию 5 секунд
-    
-    // Настройки оповещения
-    if (sensor.containsKey("alertSettings")) {
+    // Валидация: интервал мониторинга 1-3600 секунд (1 сек - 1 час)
+    config.monitoringInterval = constrain((int)(sensor["monitoringInterval"] | 5), 1, 3600);
+
+    // Настройки оповещения с валидацией температур (-55..+125°C - диапазон DS18B20)
+    if (sensor["alertSettings"].is<JsonObject>()) {
       JsonObject alert = sensor["alertSettings"];
-      config.alertMinTemp = alert["minTemp"] | 10.0;
-      config.alertMaxTemp = alert["maxTemp"] | 30.0;
+      config.alertMinTemp = constrain((float)(alert["minTemp"] | 10.0), -55.0f, 125.0f);
+      config.alertMaxTemp = constrain((float)(alert["maxTemp"] | 30.0), -55.0f, 125.0f);
       config.alertBuzzerEnabled = alert["buzzerEnabled"] | true;
     } else {
       config.alertMinTemp = 10.0;
       config.alertMaxTemp = 30.0;
       config.alertBuzzerEnabled = true;
     }
-    
-    // Настройки стабилизации
-    if (sensor.containsKey("stabilizationSettings")) {
+
+    // Настройки стабилизации с валидацией
+    if (sensor["stabilizationSettings"].is<JsonObject>()) {
       JsonObject stab = sensor["stabilizationSettings"];
-      config.stabTargetTemp = stab["targetTemp"] | 25.0;
-      config.stabTolerance = stab["tolerance"] | 0.1;
-      config.stabAlertThreshold = stab["alertThreshold"] | 0.2;
-      config.stabDuration = (stab["duration"] | 10) * 1000; // Конвертируем в миллисекунды
+      config.stabTargetTemp = constrain((float)(stab["targetTemp"] | 25.0), -55.0f, 125.0f);
+      config.stabTolerance = constrain((float)(stab["tolerance"] | 0.1), 0.1f, 10.0f);
+      config.stabAlertThreshold = constrain((float)(stab["alertThreshold"] | 0.2), 0.1f, 20.0f);
+      // Валидация: длительность 1-3600 секунд
+      int durationSec = constrain((int)(stab["duration"] | 10), 1, 3600);
+      config.stabDuration = durationSec * 1000; // Конвертируем в миллисекунды
     } else {
       config.stabTargetTemp = 25.0;
       config.stabTolerance = 0.1;
