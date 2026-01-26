@@ -849,13 +849,11 @@ void startWebServer() {
   });
   
   // Обработчик для OPTIONS запросов (CORS preflight)
+  // CORS отключён - разрешены только same-origin запросы (защита от XSS с других сайтов)
   server.onNotFound([](AsyncWebServerRequest *request){
     if (request->method() == HTTP_OPTIONS) {
-      AsyncWebServerResponse *response = request->beginResponse(200);
-      response->addHeader("Access-Control-Allow-Origin", "*");
-      response->addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      response->addHeader("Access-Control-Allow-Headers", "Content-Type");
-      request->send(response);
+      // Без CORS заголовков браузер блокирует cross-origin запросы
+      request->send(204);
     } else if (request->url() == "/favicon.ico") {
       // Отправляем пустой ответ для favicon.ico
       request->send(204);
