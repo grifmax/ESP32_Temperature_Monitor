@@ -631,9 +631,13 @@ void loop() {
   if (millis() - lastSensorUpdate > 10000) {
     readTemperature();
     lastSensorUpdate = millis();
-    
+
+    // Статический массив для отслеживания времени последней отправки метрик
+    // (вынесен из цикла для лучшей читаемости и корректности)
+    static unsigned long lastMetricsSend[MAX_SENSORS] = {0};
+
     int sensorCount = getSensorCount();
-    
+
     // Обрабатываем каждый термометр
     for (int i = 0; i < sensorCount && i < MAX_SENSORS; i++) {
       uint8_t address[8];
@@ -674,7 +678,6 @@ void loop() {
           
           // Проверяем, нужно ли отправить метрики (только если WiFi подключен)
           // Используем индивидуальный интервал для каждого термометра
-          static unsigned long lastMetricsSend[MAX_SENSORS] = {0};
           unsigned long intervalMs = (config->monitoringInterval > 0) ? (config->monitoringInterval * 1000) : 5000;
           if (WiFi.status() == WL_CONNECTED && (millis() - lastMetricsSend[i] > intervalMs)) {
             // Отправляем метрики для всех термометров одним сообщением

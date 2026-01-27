@@ -478,9 +478,18 @@ void startWebServer() {
   // API для сохранения настроек
   static String settingsRequestBody = "";
   static size_t expectedTotal = 0;
+  static bool requestInProgress = false;  // Флаг для защиты от одновременных запросов
   server.on("/api/settings", HTTP_POST,
     [](AsyncWebServerRequest *request){
-      // Начало запроса - очищаем буфер
+      // Начало запроса - проверяем, не обрабатывается ли уже другой запрос
+      if (requestInProgress) {
+        AsyncWebServerResponse *response = request->beginResponse(503, "application/json",
+          "{\"status\":\"error\",\"message\":\"Another request in progress\"}");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+        return;
+      }
+      requestInProgress = true;
       settingsRequestBody = "";
       expectedTotal = 0;
     },
@@ -493,6 +502,7 @@ void startWebServer() {
         Serial.print(total);
         Serial.println(F(" bytes"));
         settingsRequestBody = ""; // Очищаем при ошибке
+        requestInProgress = false;  // Освобождаем флаг
         AsyncWebServerResponse *response = request->beginResponse(413, "application/json", "{\"status\":\"error\",\"message\":\"Request too large\"}");
         response->addHeader("Access-Control-Allow-Origin", "*");
         request->send(response);
@@ -503,6 +513,7 @@ void startWebServer() {
       if (settingsSaveInProgress) {
         Serial.println(F("ERROR: Another save in progress"));
         settingsRequestBody = "";
+        requestInProgress = false;  // Освобождаем флаг
         AsyncWebServerResponse *response = request->beginResponse(503, "application/json", "{\"status\":\"error\",\"message\":\"Another save in progress, try again later\"}");
         response->addHeader("Access-Control-Allow-Origin", "*");
         request->send(response);
@@ -520,6 +531,7 @@ void startWebServer() {
       if (total != expectedTotal) {
         Serial.println(F("ERROR: Request size mismatch"));
         settingsRequestBody = "";
+        requestInProgress = false;  // Освобождаем флаг
         AsyncWebServerResponse *response = request->beginResponse(400, "application/json", "{\"status\":\"error\",\"message\":\"Request corrupted\"}");
         response->addHeader("Access-Control-Allow-Origin", "*");
         request->send(response);
@@ -543,14 +555,15 @@ void startWebServer() {
         // Проверяем, что буфер не пустой
         if (settingsRequestBody.length() == 0) {
           Serial.println(F("ERROR: Empty request body"));
+          requestInProgress = false;  // Освобождаем флаг
           AsyncWebServerResponse *response = request->beginResponse(400, "application/json", "{\"status\":\"error\",\"message\":\"Empty request\"}");
           response->addHeader("Access-Control-Allow-Origin", "*");
           request->send(response);
           return;
         }
 
-        // Полная валидация JSON через парсинг
-        StaticJsonDocument<256> testDoc;
+        // Полная валидация JSON через парсинг (увеличен размер для сложных JSON)
+        DynamicJsonDocument testDoc(4096);
         DeserializationError parseError = deserializeJson(testDoc, settingsRequestBody);
 
         if (parseError) {
@@ -558,6 +571,7 @@ void startWebServer() {
           Serial.println(parseError.c_str());
           String errorMsg = String("Invalid JSON: ") + parseError.c_str();
           settingsRequestBody = "";
+          requestInProgress = false;  // Освобождаем флаг
           AsyncWebServerResponse *response = request->beginResponse(400, "application/json", "{\"status\":\"error\",\"message\":\"" + errorMsg + "\"}");
           response->addHeader("Access-Control-Allow-Origin", "*");
           request->send(response);
@@ -568,6 +582,7 @@ void startWebServer() {
         if (pendingSettingsSave || settingsSaveInProgress) {
           Serial.println(F("ERROR: Save queue busy"));
           settingsRequestBody = "";
+          requestInProgress = false;  // Освобождаем флаг
           AsyncWebServerResponse *response = request->beginResponse(503, "application/json", "{\"status\":\"error\",\"message\":\"Save queue busy, try again later\"}");
           response->addHeader("Access-Control-Allow-Origin", "*");
           request->send(response);
@@ -591,6 +606,7 @@ void startWebServer() {
         // Очищаем буфер после обработки
         settingsRequestBody = "";
         expectedTotal = 0;
+        requestInProgress = false;  // Освобождаем флаг
       }
     });
 
