@@ -109,7 +109,13 @@ void startWebServer() {
   server.on("/settings.js", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(SPIFFS, "/settings.js", "application/javascript");
   });
-  
+  server.on("/chart.min.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(SPIFFS, "/chart.min.js", "application/javascript");
+  });
+  server.on("/chartjs-plugin-zoom.min.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(SPIFFS, "/chartjs-plugin-zoom.min.js", "application/javascript");
+  });
+
   // JSON API endpoint для получения данных
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
     // Увеличено для поддержки данных о термометрах

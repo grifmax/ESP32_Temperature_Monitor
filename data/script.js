@@ -161,7 +161,6 @@ async function loadSensors() {
                     buzzerEnabled: true
                 },
                 stabilizationSettings: {
-                    targetTemp: 25.0,
                     tolerance: 0.1,
                     alertThreshold: 0.2,
                     duration: 10,
@@ -184,7 +183,7 @@ async function loadSensors() {
             sendToNetworks: true,
             buzzerEnabled: false,
             alertSettings: { minTemp: 10.0, maxTemp: 30.0, buzzerEnabled: true },
-            stabilizationSettings: { targetTemp: 25.0, tolerance: 0.1, alertThreshold: 0.2, duration: 10, buzzerEnabled: true }
+            stabilizationSettings: { tolerance: 0.1, alertThreshold: 0.2, duration: 10, buzzerEnabled: true }
         }];
         renderSensorCells();
         updateChartSensorSelectors();
@@ -309,10 +308,10 @@ function openSensorSettings(sensorId) {
     
     // Настройки стабилизации
     if (sensor.stabilizationSettings) {
-        document.getElementById('modal-stab-target-temp').value = sensor.stabilizationSettings.targetTemp || 25.0;
         document.getElementById('modal-stab-tolerance').value = sensor.stabilizationSettings.tolerance || 0.1;
         document.getElementById('modal-stab-alert-threshold').value = sensor.stabilizationSettings.alertThreshold || 0.2;
         document.getElementById('modal-stab-duration').value = sensor.stabilizationSettings.duration || 10;
+        document.getElementById('modal-stab-buzzer').checked = sensor.stabilizationSettings.buzzerEnabled !== false;
     }
     
     // Настройки мониторинга
@@ -383,10 +382,10 @@ async function saveSensorSettings() {
     
     if (sensor.mode === 'stabilization') {
         if (!sensor.stabilizationSettings) sensor.stabilizationSettings = {};
-        sensor.stabilizationSettings.targetTemp = parseFloat(document.getElementById('modal-stab-target-temp').value) || 25.0;
         sensor.stabilizationSettings.tolerance = parseFloat(document.getElementById('modal-stab-tolerance').value) || 0.1;
         sensor.stabilizationSettings.alertThreshold = parseFloat(document.getElementById('modal-stab-alert-threshold').value) || 0.2;
         sensor.stabilizationSettings.duration = parseInt(document.getElementById('modal-stab-duration').value) || 10;
+        sensor.stabilizationSettings.buzzerEnabled = document.getElementById('modal-stab-buzzer').checked;
     }
     
     // Сохраняем на сервер через общий API датчиков
@@ -407,10 +406,10 @@ async function saveSensorSettings() {
                 buzzerEnabled: true
             },
             stabilizationSettings: s.stabilizationSettings || {
-                targetTemp: 25.0,
                 tolerance: 0.1,
                 alertThreshold: 0.2,
-                duration: 10
+                duration: 10,
+                buzzerEnabled: true
             }
         }));
         

@@ -355,6 +355,15 @@ void setup() {
     sensorStates[i].lastSentTemp = 0.0;
     sensorStates[i].stabilizationStartTime = 0;
     sensorStates[i].isStabilized = false;
+    sensorStates[i].baselineTemp = -127.0;
+    sensorStates[i].historyIndex = 0;
+    sensorStates[i].historyCount = 0;
+    sensorStates[i].alertSent = false;
+    sensorStates[i].lastAlertTime = 0;
+    for (int j = 0; j < STAB_HISTORY_SIZE; j++) {
+      sensorStates[i].tempHistory[j] = -127.0;
+      sensorStates[i].timeHistory[j] = 0;
+    }
     sensorConfigs[i].valid = false;
   }
   
@@ -506,19 +515,22 @@ void loadSensorConfigs() {
     }
 
     // Настройки стабилизации с валидацией
+    // tolerance - максимальный разброс температур за duration для признания стабильности
+    // alertThreshold - порог резкого скачка от базовой температуры для тревоги
+    // duration - время ожидания стабилизации (по умолчанию 10 минут)
     if (sensor["stabilizationSettings"].is<JsonObject>()) {
       JsonObject stab = sensor["stabilizationSettings"];
-      config.stabTargetTemp = constrain((float)(stab["targetTemp"] | 25.0), -55.0f, 125.0f);
-      config.stabTolerance = constrain((float)(stab["tolerance"] | 0.1), 0.1f, 10.0f);
-      config.stabAlertThreshold = constrain((float)(stab["alertThreshold"] | 0.2), 0.1f, 20.0f);
-      // Валидация: длительность 1-3600 секунд
-      int durationSec = constrain((int)(stab["duration"] | 10), 1, 3600);
-      config.stabDuration = durationSec * 1000; // Конвертируем в миллисекунды
+      config.stabTolerance = constrain((float)(stab["tolerance"] | 0.1), 0.01f, 5.0f);
+      config.stabAlertThreshold = constrain((float)(stab["alertThreshold"] | 0.2), 0.05f, 10.0f);
+      config.stabBuzzerEnabled = stab["buzzerEnabled"] | true;
+      // Валидация: длительность 1-60 минут (60-3600 секунд)
+      int durationMin = constrain((int)(stab["duration"] | 10), 1, 60);
+      config.stabDuration = durationMin * 60 * 1000UL; // Конвертируем минуты в миллисекунды
     } else {
-      config.stabTargetTemp = 25.0;
-      config.stabTolerance = 0.1;
-      config.stabAlertThreshold = 0.2;
-      config.stabDuration = 10000; // 10 секунд по умолчанию
+      config.stabTolerance = 0.1;      // 0.1°C - разброс для стабильности
+      config.stabAlertThreshold = 0.2; // 0.2°C - порог резкого скачка
+      config.stabBuzzerEnabled = true;
+      config.stabDuration = 10 * 60 * 1000UL; // 10 минут по умолчанию
     }
     
     config.valid = true;
@@ -712,52 +724,167 @@ void loop() {
           }
         }
       } else if (config->mode == "stabilization") {
-        float diff = fabs(correctedTemp - config->stabTargetTemp);
-        
-        // Проверка стабилизации
-        if (diff <= config->stabTolerance) {
-          if (!sensorStates[i].isStabilized) {
-            sensorStates[i].isStabilized = true;
-            sensorStates[i].stabilizationStartTime = millis();
+        // === РЕЖИМ СТАБИЛИЗАЦИИ ===
+        // Логика: ждём стабилизации температуры, затем отслеживаем РЕЗКИЕ скачки
+        // Плавный дрейф (из-за атм. давления и т.д.) - не тревога
+
+        SensorState* state = &sensorStates[i];
+        unsigned long now = millis();
+
+        // 1. Добавляем температуру в кольцевой буфер истории
+        state->tempHistory[state->historyIndex] = correctedTemp;
+        state->timeHistory[state->historyIndex] = now;
+        state->historyIndex = (state->historyIndex + 1) % STAB_HISTORY_SIZE;
+        if (state->historyCount < STAB_HISTORY_SIZE) {
+          state->historyCount++;
+        }
+
+        // 2. Анализ стабильности: ищем min/max за период stabDuration
+        float minTemp = 999.0, maxTemp = -999.0;
+        float sumTemp = 0.0;
+        int validCount = 0;
+
+        for (int j = 0; j < state->historyCount; j++) {
+          // Проверяем, что запись в пределах duration
+          if (now - state->timeHistory[j] <= config->stabDuration) {
+            float t = state->tempHistory[j];
+            if (t > -100.0) { // Валидная температура
+              if (t < minTemp) minTemp = t;
+              if (t > maxTemp) maxTemp = t;
+              sumTemp += t;
+              validCount++;
+            }
           }
-          
-          if (millis() - sensorStates[i].stabilizationStartTime >= config->stabDuration) {
-            buzzerBeep(BUZZER_STABILIZATION);
-            sensorStates[i].stabilizationStartTime = millis() + 60000; // Не отправляем снова в течение минуты
-            
-            // Отправляем метрики только если WiFi подключен
-            if (WiFi.status() == WL_CONNECTED) {
-              sendMetricsToTelegram("", -127.0); // Пустое имя означает "отправить все"
-              
-              // Обновляем lastSentTemp для всех термометров (O(n) вместо O(n^2))
-              for (int j = 0; j < sensorCount && j < MAX_SENSORS; j++) {
-                if (j == i) {
-                  sensorStates[j].lastSentTemp = correctedTemp;
-                  continue;
-                }
-                SensorConfig* jConfig = getConfigForSensor(j);
-                if (jConfig && jConfig->valid) {
-                  float jTemp = getSensorTemperature(j);
-                  float jCorr = (jTemp != -127.0) ? (jTemp + jConfig->correction) : -127.0;
-                  if (jCorr != -127.0) {
-                    sensorStates[j].lastSentTemp = jCorr;
-                  }
-                }
-                yield(); // Даем время другим задачам
+        }
+
+        // 3. Определяем стабильность: разброс (max-min) <= tolerance
+        bool currentlyStable = false;
+        float avgTemp = 0.0;
+
+        if (validCount > 0) {
+          avgTemp = sumTemp / validCount;
+          float spread = maxTemp - minTemp;
+
+          // Стабильна, если разброс в пределах tolerance И прошло достаточно времени
+          // Нужно минимум stabDuration/2 данных для надёжного анализа
+          unsigned long minDataTime = config->stabDuration / 2;
+          unsigned long oldestValidTime = now;
+          for (int j = 0; j < state->historyCount; j++) {
+            if (now - state->timeHistory[j] <= config->stabDuration && state->tempHistory[j] > -100.0) {
+              if (state->timeHistory[j] < oldestValidTime) {
+                oldestValidTime = state->timeHistory[j];
               }
             }
-            break; // Обработали, выходим
+          }
+          unsigned long dataSpan = now - oldestValidTime;
+
+          currentlyStable = (spread <= config->stabTolerance) && (dataSpan >= minDataTime);
+        }
+
+        // 4. Логика переходов состояний
+        if (!state->isStabilized) {
+          // === Фаза ожидания стабилизации ===
+          if (currentlyStable) {
+            // Температура стабильна - фиксируем базовую температуру
+            state->isStabilized = true;
+            state->baselineTemp = avgTemp;
+            state->alertSent = false;
+            state->stabilizationStartTime = now;
+
+            // Уведомление о стабилизации (один раз)
+            Serial.printf("[STAB] %s: стабилизация достигнута, базовая=%.2f°C\n",
+                          config->name.c_str(), state->baselineTemp);
+
+            // Короткий сигнал о достижении стабилизации
+            buzzerBeep(BUZZER_STABILIZATION);
+
+            // Отправляем уведомление о стабилизации
+            if (config->sendToNetworks && WiFi.status() == WL_CONNECTED) {
+              String msg = "✅ " + config->name + ": температура стабилизировалась на " +
+                          String(state->baselineTemp, 1) + "°C";
+              sendTemperatureAlert(config->name, state->baselineTemp, msg);
+              state->lastSentTemp = correctedTemp;
+            }
           }
         } else {
-          sensorStates[i].isStabilized = false;
-        }
-        
-        // Проверка тревоги стабилизации
-        if (diff > config->stabAlertThreshold) {
-          if (fabs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
-            sendTemperatureAlert(config->name, correctedTemp, "⚠️ Отклонение от целевой температуры!");
-            buzzerBeep(BUZZER_ALERT);
-            sensorStates[i].lastSentTemp = correctedTemp;
+          // === Фаза отслеживания скачков ===
+          float diffFromBaseline = correctedTemp - state->baselineTemp;
+          float absDiff = fabs(diffFromBaseline);
+
+          // Проверяем резкий скачок
+          if (absDiff >= config->stabAlertThreshold) {
+            // Определяем: это резкий скачок или плавный дрейф?
+            // Резкий скачок = большое изменение за короткое время
+            // Смотрим скорость изменения за последние 30 секунд
+
+            float recentMin = 999.0, recentMax = -999.0;
+            for (int j = 0; j < state->historyCount; j++) {
+              if (now - state->timeHistory[j] <= 30000) { // последние 30 сек
+                float t = state->tempHistory[j];
+                if (t > -100.0) {
+                  if (t < recentMin) recentMin = t;
+                  if (t > recentMax) recentMax = t;
+                }
+              }
+            }
+
+            float recentSpread = (recentMax > -100.0 && recentMin < 100.0) ? (recentMax - recentMin) : 0.0;
+
+            // Резкий скачок: за последние 30 сек изменение >= alertThreshold/2
+            bool isSharpJump = (recentSpread >= config->stabAlertThreshold * 0.5f);
+
+            if (isSharpJump) {
+              // === ТРЕВОГА: резкий скачок температуры! ===
+              // Cooldown 60 секунд между тревогами
+              if (!state->alertSent || (now - state->lastAlertTime > 60000)) {
+                String direction = (diffFromBaseline > 0) ? "⬆️ РОСТ" : "⬇️ ПАДЕНИЕ";
+                String msg = "🚨 " + config->name + ": " + direction + " температуры!\n" +
+                            "Было: " + String(state->baselineTemp, 2) + "°C\n" +
+                            "Стало: " + String(correctedTemp, 2) + "°C\n" +
+                            "Скачок: " + String(diffFromBaseline, 2) + "°C";
+
+                Serial.printf("[STAB] %s: ТРЕВОГА! Скачок %.2f°C (было %.2f, стало %.2f)\n",
+                              config->name.c_str(), diffFromBaseline, state->baselineTemp, correctedTemp);
+
+                if (config->stabBuzzerEnabled) {
+                  buzzerBeep(BUZZER_ALERT);
+                }
+
+                if (config->sendToNetworks && WiFi.status() == WL_CONNECTED) {
+                  sendTemperatureAlert(config->name, correctedTemp, msg);
+                  state->lastSentTemp = correctedTemp;
+                }
+
+                state->alertSent = true;
+                state->lastAlertTime = now;
+              }
+            } else {
+              // Плавный дрейф - обновляем базовую температуру
+              // (температура медленно изменилась, это нормально)
+              Serial.printf("[STAB] %s: плавный дрейф, обновляем базовую %.2f -> %.2f°C\n",
+                            config->name.c_str(), state->baselineTemp, avgTemp);
+              state->baselineTemp = avgTemp;
+              state->alertSent = false; // Сбрасываем флаг тревоги
+            }
+          } else {
+            // Температура в норме - сбрасываем флаг тревоги
+            state->alertSent = false;
+          }
+
+          // Если температура вышла из стабильного состояния надолго - сбрасываем
+          if (!currentlyStable) {
+            // Даём 2 минуты на возврат к стабильности
+            if (now - state->stabilizationStartTime > 120000) {
+              // Переопределяем базовую на текущее среднее
+              if (validCount > 0) {
+                state->baselineTemp = avgTemp;
+                state->stabilizationStartTime = now;
+                Serial.printf("[STAB] %s: пересчёт базовой температуры -> %.2f°C\n",
+                              config->name.c_str(), state->baselineTemp);
+              }
+            }
+          } else {
+            state->stabilizationStartTime = now; // Обновляем время стабильности
           }
         }
       }

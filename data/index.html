@@ -143,24 +143,27 @@
                     <!-- Настройки режима стабилизации -->
                     <div id="modal-stabilization-settings" class="mode-settings-group" style="display: none;">
                         <h3>Настройки стабилизации</h3>
-                        <div class="form-group">
-                            <label for="modal-stab-target-temp">Целевая температура (°C)</label>
-                            <input type="number" id="modal-stab-target-temp" step="0.1" min="-55" max="125" value="25.0">
-                        </div>
+                        <p style="font-size: 0.85em; color: #666; margin-bottom: 15px;">
+                            Режим отслеживает стабилизацию температуры и сообщает о резких скачках.
+                            Плавные изменения (из-за атм. давления) игнорируются.
+                        </p>
                         <div class="form-group">
                             <label for="modal-stab-tolerance">Допуск стабильности (°C)</label>
-                            <input type="number" id="modal-stab-tolerance" step="0.01" min="0.1" max="10" value="0.1">
+                            <input type="number" id="modal-stab-tolerance" step="0.01" min="0.01" max="5" value="0.1">
+                            <small>Макс. разброс температуры для признания стабильности</small>
                         </div>
                         <div class="form-group">
                             <label for="modal-stab-alert-threshold">Порог тревоги (°C)</label>
-                            <input type="number" id="modal-stab-alert-threshold" step="0.01" min="0.1" max="20" value="0.2">
+                            <input type="number" id="modal-stab-alert-threshold" step="0.01" min="0.05" max="10" value="0.2">
+                            <small>Резкий скачок от базовой температуры для срабатывания тревоги</small>
                         </div>
                         <div class="form-group">
-                            <label for="modal-stab-duration">Время работы на уставке (минуты)</label>
+                            <label for="modal-stab-duration">Время ожидания стабилизации (минуты)</label>
                             <input type="number" id="modal-stab-duration" value="10" min="1" max="60">
+                            <small>Период анализа для определения стабильности температуры</small>
                         </div>
                         <div class="form-group">
-                            <label><input type="checkbox" id="modal-stab-buzzer" checked> Включить бипер</label>
+                            <label><input type="checkbox" id="modal-stab-buzzer" checked> Включить бипер при тревоге</label>
                         </div>
                     </div>
                     

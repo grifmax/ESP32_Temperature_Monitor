@@ -6,6 +6,10 @@
 // Максимальное количество поддерживаемых датчиков
 #define MAX_SENSORS 10
 
+// Размер кольцевого буфера для истории температур (для режима стабилизации)
+// При измерении раз в секунду: 120 = 2 минуты истории для анализа скорости изменения
+#define STAB_HISTORY_SIZE 120
+
 // Структура конфигурации датчика температуры
 struct SensorConfig {
   String address;           // Адрес датчика (hex строка)
@@ -18,19 +22,28 @@ struct SensorConfig {
   float alertMinTemp;       // Минимальный порог оповещения (-55..+125)
   float alertMaxTemp;       // Максимальный порог оповещения (-55..+125)
   bool alertBuzzerEnabled;  // Бипер при срабатывании оповещения
-  float stabTargetTemp;     // Целевая температура стабилизации (-55..+125)
-  float stabTolerance;      // Допуск стабилизации (0.1..10)
-  float stabAlertThreshold; // Порог тревоги стабилизации (0.1..20)
-  unsigned long stabDuration;       // Длительность стабилизации (мс)
+  float stabTolerance;      // Допуск стабилизации (0.1..10) - макс. разброс температур за duration
+  float stabAlertThreshold; // Порог тревоги - резкий скачок от базовой температуры (0.1..20)
+  unsigned long stabDuration;       // Время ожидания стабилизации (мс) - период анализа стабильности
   unsigned long monitoringInterval; // Интервал мониторинга (1..3600 сек)
+  bool stabBuzzerEnabled;   // Бипер при тревоге стабилизации
   bool valid;               // Флаг валидности конфигурации
 };
 
 // Структура состояния датчика (для отслеживания)
 struct SensorState {
-  float lastSentTemp;                 // Последняя отправленная температура
-  unsigned long stabilizationStartTime; // Время начала стабилизации
-  bool isStabilized;                  // Флаг стабилизации
+  float lastSentTemp;                   // Последняя отправленная температура
+  unsigned long stabilizationStartTime; // Время начала отсчёта стабилизации
+  bool isStabilized;                    // Флаг: температура стабилизировалась
+
+  // Данные для режима стабилизации (отслеживание резких скачков)
+  float baselineTemp;                   // Базовая температура после стабилизации
+  float tempHistory[STAB_HISTORY_SIZE]; // Кольцевой буфер температур
+  unsigned long timeHistory[STAB_HISTORY_SIZE]; // Временные метки
+  int historyIndex;                     // Текущий индекс в буфере
+  int historyCount;                     // Количество записей в буфере
+  bool alertSent;                       // Флаг: тревога уже отправлена
+  unsigned long lastAlertTime;          // Время последней тревоги (для cooldown)
 };
 
 // Глобальные переменные (определены в main.cpp)
