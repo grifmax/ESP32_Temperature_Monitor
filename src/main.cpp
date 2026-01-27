@@ -7,6 +7,7 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
+#include <cmath>  // для fabs()
 #include "config.h"
 #include "web_server.h"
 #include "tg_bot.h"
@@ -38,7 +39,6 @@ U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE, OLED_SCL_
 
 float currentTemp = 0.0;
 float lastSentTemp = 0.0;
-float targetTemp = 25.0;
 unsigned long lastSensorUpdate = 0;
 unsigned long lastTelegramUpdate = 0;
 unsigned long lastMqttMetricsUpdate = 0;
@@ -86,8 +86,8 @@ static void buildSensorConfigIndex() {
   int sensorCount = getSensorCount();
   for (int i = 0; i < sensorCount && i < MAX_SENSORS; i++) {
     String addressStr = getSensorAddressString(i);
-    // Ищем соответствующую конфигурацию
-    for (int j = 0; j < sensorConfigCount; j++) {
+    // Ищем соответствующую конфигурацию (с проверкой границ массива)
+    for (int j = 0; j < sensorConfigCount && j < MAX_SENSORS; j++) {
       if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
         sensorToConfigIndex[i] = j;
         break;
@@ -668,7 +668,7 @@ void loop() {
       
       // Обрабатываем режим работы термометра
       if (config->mode == "monitoring") {
-        if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
+        if (fabs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
           // Обновляем lastSentTemp для текущего термометра
           sensorStates[i].lastSentTemp = correctedTemp;
           
@@ -699,7 +699,7 @@ void loop() {
         }
       } else if (config->mode == "alert") {
         if (correctedTemp <= config->alertMinTemp || correctedTemp >= config->alertMaxTemp) {
-          if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
+          if (fabs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
             String alertType = (correctedTemp >= config->alertMaxTemp) ? "high" : "low";
             sendTemperatureAlert(config->name, correctedTemp, alertType);
             if (config->alertBuzzerEnabled) {
@@ -709,7 +709,7 @@ void loop() {
           }
         }
       } else if (config->mode == "stabilization") {
-        float diff = abs(correctedTemp - config->stabTargetTemp);
+        float diff = fabs(correctedTemp - config->stabTargetTemp);
         
         // Проверка стабилизации
         if (diff <= config->stabTolerance) {
@@ -751,7 +751,7 @@ void loop() {
         
         // Проверка тревоги стабилизации
         if (diff > config->stabAlertThreshold) {
-          if (abs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
+          if (fabs(correctedTemp - sensorStates[i].lastSentTemp) > 0.1) {
             sendTemperatureAlert(config->name, correctedTemp, "⚠️ Отклонение от целевой температуры!");
             buzzerBeep(BUZZER_ALERT);
             sensorStates[i].lastSentTemp = correctedTemp;

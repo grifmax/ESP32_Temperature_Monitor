@@ -1315,7 +1315,7 @@ void sendMetricsToTelegram(const String& sensorName, float temperature) {
         float correction = 0.0;
         bool enabled = true;
         
-        for (int j = 0; j < sensorConfigCount; j++) {
+        for (int j = 0; j < sensorConfigCount && j < MAX_SENSORS; j++) {
           if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
             name = sensorConfigs[j].name;
             correction = sensorConfigs[j].correction;
