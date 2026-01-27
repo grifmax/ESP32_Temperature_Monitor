@@ -13,8 +13,8 @@ AlertModeSettings alertSettings = {
 };
 
 // Настройки режима стабилизации
+// targetTemp убран - используется per-sensor stabTargetTemp
 StabilizationModeSettings stabilizationSettings = {
-  .targetTemp = 25.0,
   .tolerance = 0.1,
   .alertThreshold = 0.2,
   .duration = 600  // 10 минут
@@ -64,8 +64,8 @@ AlertModeSettings getAlertSettings() {
   return alertSettings;
 }
 
-void setStabilizationSettings(float targetTemp, float tolerance, float alertThreshold, unsigned long duration) {
-  stabilizationSettings.targetTemp = targetTemp;
+void setStabilizationSettings(float tolerance, float alertThreshold, unsigned long duration) {
+  // targetTemp убран - используется per-sensor stabTargetTemp
   stabilizationSettings.tolerance = tolerance;
   stabilizationSettings.alertThreshold = alertThreshold;
   stabilizationSettings.duration = duration;
@@ -80,55 +80,22 @@ void updateOperationMode() {
   // Здесь можно добавить общую логику, если потребуется
 }
 
-// Функция проверки стабилизации (вызывается извне)
+// Функция проверки стабилизации (устарела - используется per-sensor логика в main.cpp)
+// targetTemp убран из глобальных настроек - функция оставлена для обратной совместимости
 bool checkStabilization(float currentTemp) {
-  if (currentMode != MODE_STABILIZATION) {
-    return false;
-  }
-  
-  float diff = abs(currentTemp - stabilizationSettings.targetTemp);
-  
-  // Проверка на попадание в допуск
-  if (diff <= stabilizationSettings.tolerance) {
-    if (!stabilizationState.isStabilized) {
-      // Только что стабилизировались
-      stabilizationState.isStabilized = true;
-      stabilizationState.stabilizationStartTime = millis();
-      stabilizationState.lastTemp = currentTemp;
-      stabilizationState.lastChangeTime = millis();
-    } else {
-      // Проверяем, что температура не меняется значительно
-      if (abs(currentTemp - stabilizationState.lastTemp) > stabilizationSettings.tolerance) {
-        // Температура вышла за допуск
-        stabilizationState.isStabilized = false;
-        stabilizationState.stabilizationStartTime = 0;
-      }
-      stabilizationState.lastTemp = currentTemp;
-      stabilizationState.lastChangeTime = millis();
-    }
-  } else {
-    // Не в допуске
-    stabilizationState.isStabilized = false;
-    stabilizationState.stabilizationStartTime = 0;
-  }
-  
-  // Проверка времени работы на уставке
-  if (stabilizationState.isStabilized && 
-      (millis() - stabilizationState.stabilizationStartTime) >= (stabilizationSettings.duration * 1000)) {
-    return true; // Стабилизация завершена успешно
-  }
-  
+  // Эта функция больше не используется - per-sensor стабилизация реализована в main.cpp
+  // Возвращаем false для безопасности
+  (void)currentTemp; // Подавляем предупреждение о неиспользуемом параметре
   return false;
 }
 
-// Функция проверки превышения порога тревоги в режиме стабилизации
+// Функция проверки превышения порога тревоги в режиме стабилизации (устарела)
+// targetTemp убран из глобальных настроек - функция оставлена для обратной совместимости
 bool checkStabilizationAlert(float currentTemp) {
-  if (currentMode != MODE_STABILIZATION) {
-    return false;
-  }
-  
-  float diff = abs(currentTemp - stabilizationSettings.targetTemp);
-  return diff > stabilizationSettings.alertThreshold;
+  // Эта функция больше не используется - per-sensor стабилизация реализована в main.cpp
+  // Возвращаем false для безопасности
+  (void)currentTemp; // Подавляем предупреждение о неиспользуемом параметре
+  return false;
 }
 
 // Получение состояния стабилизации

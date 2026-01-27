@@ -89,19 +89,22 @@ TemperatureRecord* getHistoryForPeriod(unsigned long startTime, unsigned long en
   // Создаем временный массив только нужного размера (экономия памяти)
   static TemperatureRecord* filtered = nullptr;
   static int filteredSize = 0;
-  
+
   // Перераспределяем память только если нужно больше места
   if (filteredCount > filteredSize) {
-    if (filtered != nullptr) {
-      free(filtered);
-    }
-    filtered = (TemperatureRecord*)malloc(filteredCount * sizeof(TemperatureRecord));
-    filteredSize = filteredCount;
-    if (filtered == nullptr) {
-      filteredSize = 0;
+    // Сначала выделяем новую память, потом освобождаем старую
+    TemperatureRecord* newFiltered = (TemperatureRecord*)malloc(filteredCount * sizeof(TemperatureRecord));
+    if (newFiltered == nullptr) {
+      // Ошибка выделения - НЕ освобождаем старый буфер, он еще может быть полезен
       *count = 0;
       return nullptr;
     }
+    // Успешно выделили - теперь можно освободить старый буфер
+    if (filtered != nullptr) {
+      free(filtered);
+    }
+    filtered = newFiltered;
+    filteredSize = filteredCount;
   }
   
   // Заполняем массив

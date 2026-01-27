@@ -39,7 +39,43 @@ struct TelegramMessage {
   String chatId;
   String message;
   bool isTestMessage;
+  bool inUse;  // Для статического пула
 };
+
+// Статический пул сообщений вместо new/delete (предотвращает фрагментацию heap)
+#define TELEGRAM_POOL_SIZE 5
+static TelegramMessage messagePool[TELEGRAM_POOL_SIZE];
+static SemaphoreHandle_t poolMutex = NULL;
+
+// Функции для работы со статическим пулом сообщений
+static TelegramMessage* allocateMessage() {
+  if (poolMutex == NULL) return nullptr;
+  if (xSemaphoreTake(poolMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    for (int i = 0; i < TELEGRAM_POOL_SIZE; i++) {
+      if (!messagePool[i].inUse) {
+        messagePool[i].inUse = true;
+        messagePool[i].chatId = "";
+        messagePool[i].message = "";
+        messagePool[i].isTestMessage = false;
+        xSemaphoreGive(poolMutex);
+        return &messagePool[i];
+      }
+    }
+    xSemaphoreGive(poolMutex);
+  }
+  return nullptr;  // Пул исчерпан
+}
+
+static void freeMessage(TelegramMessage* msg) {
+  if (msg == nullptr || poolMutex == NULL) return;
+  if (xSemaphoreTake(poolMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    msg->chatId = "";
+    msg->message = "";
+    msg->isTestMessage = false;
+    msg->inUse = false;
+    xSemaphoreGive(poolMutex);
+  }
+}
 
 // Очередь для Telegram сообщений
 QueueHandle_t telegramQueue = NULL;
@@ -54,6 +90,113 @@ const int MAX_TELEGRAM_FAILURES = 3; // После 3 неудач подряд -
 // FreeRTOS task handle для Telegram polling
 TaskHandle_t telegramTaskHandle = NULL;
 volatile bool telegramTaskRunning = false;
+
+// ========== ИНТЕРАКТИВНЫЙ РЕЖИМ НАСТРОЙКИ ==========
+
+// Этапы интерактивного диалога
+enum InteractiveStep {
+  STEP_NONE = 0,           // Нет активного диалога
+  STEP_SELECT_MODE,        // Выбор режима работы
+  STEP_ALERT_MIN_TEMP,     // Ввод минимальной температуры
+  STEP_ALERT_MAX_TEMP,     // Ввод максимальной температуры
+  STEP_ALERT_BUZZER,       // Включение зуммера
+  STEP_STAB_TOLERANCE,     // Допуск стабилизации
+  STEP_STAB_ALERT,         // Порог тревоги
+  STEP_STAB_DURATION       // Длительность
+};
+
+// Структура состояния интерактивной сессии
+struct InteractiveSession {
+  String chatId;                    // ID чата
+  InteractiveStep step;             // Текущий этап
+  unsigned long lastActivity;       // Время последней активности
+  OperationMode selectedMode;       // Выбранный режим
+  float alertMinTemp;               // Временные настройки оповещения
+  float alertMaxTemp;
+  bool alertBuzzer;
+  float stabTolerance;              // Временные настройки стабилизации
+  float stabAlertThreshold;
+  unsigned long stabDuration;
+  bool valid;                       // Сессия активна
+};
+
+// Пул сессий (статический, без динамической памяти)
+#define MAX_INTERACTIVE_SESSIONS 3
+static InteractiveSession sessions[MAX_INTERACTIVE_SESSIONS];
+static const unsigned long SESSION_TIMEOUT = 300000;  // 5 минут таймаут
+
+// Инициализация интерактивных сессий
+static void initInteractiveSessions() {
+  for (int i = 0; i < MAX_INTERACTIVE_SESSIONS; i++) {
+    sessions[i].valid = false;
+    sessions[i].chatId = "";
+    sessions[i].step = STEP_NONE;
+    sessions[i].lastActivity = 0;
+  }
+}
+
+// Получение сессии для chat_id
+static InteractiveSession* getSession(const String& chatId) {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_INTERACTIVE_SESSIONS; i++) {
+    if (sessions[i].valid && sessions[i].chatId == chatId) {
+      // Проверяем таймаут
+      if (now - sessions[i].lastActivity > SESSION_TIMEOUT) {
+        sessions[i].valid = false;  // Сессия истекла
+        return nullptr;
+      }
+      sessions[i].lastActivity = now;
+      return &sessions[i];
+    }
+  }
+  return nullptr;
+}
+
+// Создание новой сессии
+static InteractiveSession* createSession(const String& chatId) {
+  unsigned long now = millis();
+
+  // Очищаем истекшие сессии
+  for (int i = 0; i < MAX_INTERACTIVE_SESSIONS; i++) {
+    if (sessions[i].valid && (now - sessions[i].lastActivity > SESSION_TIMEOUT)) {
+      sessions[i].valid = false;
+    }
+  }
+
+  // Ищем свободный слот
+  for (int i = 0; i < MAX_INTERACTIVE_SESSIONS; i++) {
+    if (!sessions[i].valid) {
+      sessions[i].chatId = chatId;
+      sessions[i].step = STEP_SELECT_MODE;
+      sessions[i].lastActivity = now;
+      sessions[i].valid = true;
+      // Инициализация значений по умолчанию
+      sessions[i].alertMinTemp = 10.0;
+      sessions[i].alertMaxTemp = 30.0;
+      sessions[i].alertBuzzer = true;
+      sessions[i].stabTolerance = 0.1;
+      sessions[i].stabAlertThreshold = 0.2;
+      sessions[i].stabDuration = 600;
+      return &sessions[i];
+    }
+  }
+  return nullptr;  // Нет свободных слотов
+}
+
+// Удаление сессии
+static void deleteSession(const String& chatId) {
+  for (int i = 0; i < MAX_INTERACTIVE_SESSIONS; i++) {
+    if (sessions[i].valid && sessions[i].chatId == chatId) {
+      sessions[i].valid = false;
+      sessions[i].chatId = "";
+      sessions[i].step = STEP_NONE;
+      break;
+    }
+  }
+}
+
+// Forward declaration
+static void sendTelegramMessageToQueue(const String& chatId, const String& message, bool isTest = false);
 
 static void updateTelegramFlags() {
   telegramConfigured = telegramBotToken.length() > 0;
@@ -85,23 +228,42 @@ void ensureTelegramBot() {
 
 // Инициализация очереди Telegram сообщений
 void initTelegramQueue() {
+  // Инициализация мьютекса для пула сообщений
+  if (poolMutex == NULL) {
+    poolMutex = xSemaphoreCreateMutex();
+    if (poolMutex == NULL) {
+      Serial.println(F("Failed to create pool mutex"));
+    }
+  }
+
+  // Инициализация пула сообщений
+  for (int i = 0; i < TELEGRAM_POOL_SIZE; i++) {
+    messagePool[i].inUse = false;
+    messagePool[i].chatId = "";
+    messagePool[i].message = "";
+    messagePool[i].isTestMessage = false;
+  }
+
   if (telegramQueue == NULL) {
-    telegramQueue = xQueueCreate(5, sizeof(TelegramMessage*));
+    telegramQueue = xQueueCreate(TELEGRAM_POOL_SIZE, sizeof(TelegramMessage*));
     if (telegramQueue == NULL) {
       Serial.println(F("Failed to create Telegram queue"));
     }
   }
+
+  // Инициализация интерактивных сессий
+  initInteractiveSessions();
 }
 
 // Вспомогательная функция для отправки сообщения через очередь
-static void sendTelegramMessageToQueue(const String& chatId, const String& message, bool isTest = false) {
+static void sendTelegramMessageToQueue(const String& chatId, const String& message, bool isTest) {
   if (telegramQueue == NULL) {
     initTelegramQueue();
     if (telegramQueue == NULL) {
       return;
     }
   }
-  
+
   // Проверяем, не слишком ли много неудач подряд
   if (telegramConsecutiveFailures >= MAX_TELEGRAM_FAILURES) {
     unsigned long now = millis();
@@ -109,15 +271,20 @@ static void sendTelegramMessageToQueue(const String& chatId, const String& messa
       return; // Слишком много неудач, не добавляем в очередь
     }
   }
-  
-  TelegramMessage* msg = new TelegramMessage();
+
+  // Используем статический пул вместо new/delete
+  TelegramMessage* msg = allocateMessage();
+  if (msg == nullptr) {
+    // Пул исчерпан - не логируем, чтобы не засорять Serial
+    return;
+  }
+
   msg->chatId = chatId;
   msg->message = message;
   msg->isTestMessage = isTest;
-  
+
   if (xQueueSend(telegramQueue, &msg, 0) != pdTRUE) {
-    delete msg; // Очередь переполнена
-    // Не логируем каждое сообщение, чтобы не засорять Serial
+    freeMessage(msg); // Очередь переполнена - возвращаем в пул
   }
 }
 
@@ -130,25 +297,25 @@ void processTelegramQueue() {
       return;
     }
   }
-  
+
   if (telegramSendInProgress) {
     return; // Уже отправляем сообщение
   }
-  
+
   TelegramMessage* msg = NULL;
   if (xQueueReceive(telegramQueue, &msg, 0) == pdTRUE) {
     if (msg == NULL) return;
-    
+
     telegramSendInProgress = true;
-    
+
     // Проверяем подключение WiFi - критически важно перед любыми DNS запросами
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram queue: WiFi not connected, skipping message"));
-      delete msg;
+      freeMessage(msg);
       telegramSendInProgress = false;
       return;
     }
-    
+
     // Дополнительная проверка стабильности WiFi перед DNS запросами
     // Проверяем, что WiFi действительно подключен и стабилен
     static unsigned long lastWiFiCheck = 0;
@@ -156,13 +323,13 @@ void processTelegramQueue() {
     if (now - lastWiFiCheck > 1000) { // Проверяем не чаще раза в секунду
       if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
         Serial.println(F("Telegram queue: WiFi unstable, skipping message"));
-        delete msg;
+        freeMessage(msg);
         telegramSendInProgress = false;
         return;
       }
       lastWiFiCheck = now;
     }
-    
+
     ensureTelegramBot();
     updateTelegramFlags(); // Обновляем флаги перед проверкой
     if (!telegramCanSend) {
@@ -170,18 +337,18 @@ void processTelegramQueue() {
       Serial.print(telegramConfigured);
       Serial.print(F(", chatId="));
       Serial.println(telegramChatId.length() > 0 ? telegramChatId : "(empty)");
-      delete msg;
+      freeMessage(msg);
       telegramSendInProgress = false;
       return;
     }
-    
+
     if (!bot) {
       Serial.println(F("Telegram queue: Bot not initialized"));
-      delete msg;
+      freeMessage(msg);
       telegramSendInProgress = false;
       return;
     }
-    
+
     // Проверяем интервал между отправками
     now = millis(); // Используем уже объявленную переменную
     if (now - lastTelegramSendAttempt < TELEGRAM_SEND_INTERVAL) {
@@ -190,12 +357,12 @@ void processTelegramQueue() {
       telegramSendInProgress = false;
       return;
     }
-    
+
     // Проверяем, не слишком ли много неудач подряд
     if (telegramConsecutiveFailures >= MAX_TELEGRAM_FAILURES) {
       // Слишком много неудач, делаем паузу
       if (now - lastTelegramSendAttempt < 30000) { // 30 секунд паузы
-        delete msg;
+        freeMessage(msg);
         telegramSendInProgress = false;
         Serial.println(F("Telegram: Too many failures, pausing"));
         return;
@@ -204,59 +371,59 @@ void processTelegramQueue() {
         telegramConsecutiveFailures = 0;
       }
     }
-    
+
     lastTelegramSendAttempt = now;
-    
+
     // Дополнительная проверка WiFi перед отправкой
     if (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
       Serial.println(F("Telegram: WiFi unstable before send, skipping"));
-      delete msg;
+      freeMessage(msg);
       telegramSendInProgress = false;
       telegramConsecutiveFailures++;
       return;
     }
-    
+
     Serial.print(F("Telegram: Sending to chat "));
     Serial.print(msg->chatId);
     Serial.print(F(", len: "));
     Serial.println(msg->message.length());
-    
+
     // Используем Markdown для форматирования сообщений
     String parseMode = "Markdown";
     unsigned long sendStart = millis();
-    
+
     // Добавляем watchdog feed перед длительной операцией
     yield(); // Даем время другим задачам
-    
+
     // Проверяем WiFi еще раз перед отправкой (DNS lookup может быть проблемным)
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram: WiFi disconnected before send, skipping"));
-      delete msg;
+      freeMessage(msg);
       telegramSendInProgress = false;
       telegramConsecutiveFailures++;
       return;
     }
-    
+
     // Пытаемся отправить с обработкой ошибок DNS
     // Проверяем WiFi еще раз перед отправкой
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram: WiFi disconnected before send, skipping"));
-      delete msg;
+      freeMessage(msg);
       telegramSendInProgress = false;
       telegramConsecutiveFailures++;
       return;
     }
-    
+
     bool success = bot->sendMessage(msg->chatId, msg->message, parseMode);
-    
+
     // Проверяем, не отключился ли WiFi после отправки
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Telegram: WiFi disconnected after send attempt"));
       success = false;
     }
-    
+
     unsigned long sendDuration = millis() - sendStart;
-    
+
     // Проверяем таймаут и прерываем, если слишком долго
     if (sendDuration > TELEGRAM_SEND_TIMEOUT) {
       Serial.print(F("Telegram: Send took "));
@@ -268,9 +435,9 @@ void processTelegramQueue() {
         Serial.println(F("Telegram: Critical timeout, marking as failed"));
       }
     }
-    
+
     yield(); // Даем время после отправки
-    
+
     if (msg->isTestMessage) {
       if (success) {
         Serial.println(F("Telegram test: OK"));
@@ -318,8 +485,8 @@ void processTelegramQueue() {
         }
       }
     }
-    
-    delete msg;
+
+    freeMessage(msg);
     telegramSendInProgress = false;
   }
 }
@@ -392,19 +559,172 @@ void startTelegramBot() {
   }
 }
 
+// Обработка интерактивного ввода
+static bool handleInteractiveInput(const String& chatId, const String& text) {
+  InteractiveSession* session = getSession(chatId);
+  if (!session || session->step == STEP_NONE) {
+    return false;  // Нет активной сессии
+  }
+
+  String response;
+  int choice = text.toInt();
+
+  switch (session->step) {
+    case STEP_SELECT_MODE:
+      if (choice < 1 || choice > 4) {
+        response = "Неверный выбор. Введите число от 1 до 4:";
+        sendTelegramMessageToQueue(chatId, response);
+        return true;
+      }
+      switch (choice) {
+        case 1: session->selectedMode = MODE_LOCAL; break;
+        case 2: session->selectedMode = MODE_MONITORING; break;
+        case 3: session->selectedMode = MODE_ALERT; break;
+        case 4: session->selectedMode = MODE_STABILIZATION; break;
+      }
+
+      if (session->selectedMode == MODE_ALERT) {
+        session->step = STEP_ALERT_MIN_TEMP;
+        response = "Режим оповещения выбран.\n\nВведите минимальную температуру (C):";
+      } else if (session->selectedMode == MODE_STABILIZATION) {
+        session->step = STEP_STAB_TOLERANCE;
+        response = "Режим стабилизации выбран.\n\nВведите допуск температуры (C, по умолчанию 0.1):";
+      } else {
+        // MODE_LOCAL или MODE_MONITORING - сразу применяем
+        setOperationMode(session->selectedMode);
+        const char* modeNames[] = {"Локальный", "Мониторинг", "Оповещение", "Стабилизация"};
+        response = "Настройки сохранены:\n- Режим: " + String(modeNames[session->selectedMode]);
+        deleteSession(chatId);
+      }
+      sendTelegramMessageToQueue(chatId, response);
+      return true;
+
+    case STEP_ALERT_MIN_TEMP:
+      {
+        float temp = text.toFloat();
+        if (temp < -55 || temp > 125) {
+          response = "Некорректная температура. Введите значение от -55 до 125:";
+          sendTelegramMessageToQueue(chatId, response);
+          return true;
+        }
+        session->alertMinTemp = temp;
+        session->step = STEP_ALERT_MAX_TEMP;
+        response = "Минимальная температура: " + String(temp, 1) + "C\n\nВведите максимальную температуру (C):";
+        sendTelegramMessageToQueue(chatId, response);
+      }
+      return true;
+
+    case STEP_ALERT_MAX_TEMP:
+      {
+        float temp = text.toFloat();
+        if (temp < -55 || temp > 125 || temp <= session->alertMinTemp) {
+          response = "Некорректная температура. Должна быть больше минимальной (" +
+                     String(session->alertMinTemp, 1) + "C):";
+          sendTelegramMessageToQueue(chatId, response);
+          return true;
+        }
+        session->alertMaxTemp = temp;
+        session->step = STEP_ALERT_BUZZER;
+        response = "Максимальная температура: " + String(temp, 1) + "C\n\nВключить зуммер?\n1. Да\n2. Нет";
+        sendTelegramMessageToQueue(chatId, response);
+      }
+      return true;
+
+    case STEP_ALERT_BUZZER:
+      if (choice != 1 && choice != 2) {
+        response = "Введите 1 (Да) или 2 (Нет):";
+        sendTelegramMessageToQueue(chatId, response);
+        return true;
+      }
+      session->alertBuzzer = (choice == 1);
+
+      // Применяем настройки
+      setOperationMode(MODE_ALERT);
+      setAlertSettings(session->alertMinTemp, session->alertMaxTemp, session->alertBuzzer);
+
+      response = "Настройки сохранены:\n";
+      response += "- Режим: Оповещение\n";
+      response += "- Мин. температура: " + String(session->alertMinTemp, 1) + "C\n";
+      response += "- Макс. температура: " + String(session->alertMaxTemp, 1) + "C\n";
+      response += "- Зуммер: " + String(session->alertBuzzer ? "Включен" : "Выключен");
+      deleteSession(chatId);
+      sendTelegramMessageToQueue(chatId, response);
+      return true;
+
+    case STEP_STAB_TOLERANCE:
+      {
+        float tol = text.toFloat();
+        if (tol < 0.1 || tol > 10) {
+          response = "Некорректное значение. Введите допуск от 0.1 до 10:";
+          sendTelegramMessageToQueue(chatId, response);
+          return true;
+        }
+        session->stabTolerance = tol;
+        session->step = STEP_STAB_ALERT;
+        response = "Допуск: " + String(tol, 2) + "C\n\nВведите порог тревоги (C, по умолчанию 0.2):";
+        sendTelegramMessageToQueue(chatId, response);
+      }
+      return true;
+
+    case STEP_STAB_ALERT:
+      {
+        float alert = text.toFloat();
+        if (alert < 0.1 || alert > 20) {
+          response = "Некорректное значение. Введите от 0.1 до 20:";
+          sendTelegramMessageToQueue(chatId, response);
+          return true;
+        }
+        session->stabAlertThreshold = alert;
+        session->step = STEP_STAB_DURATION;
+        response = "Порог тревоги: " + String(alert, 2) + "C\n\n";
+        response += "Введите время стабилизации в секундах (по умолчанию 600 = 10 минут):";
+        sendTelegramMessageToQueue(chatId, response);
+      }
+      return true;
+
+    case STEP_STAB_DURATION:
+      {
+        unsigned long dur = text.toInt();
+        if (dur < 1 || dur > 3600) {
+          response = "Некорректное значение. Введите от 1 до 3600 секунд:";
+          sendTelegramMessageToQueue(chatId, response);
+          return true;
+        }
+        session->stabDuration = dur;
+
+        // Применяем настройки
+        setOperationMode(MODE_STABILIZATION);
+        setStabilizationSettings(session->stabTolerance, session->stabAlertThreshold, session->stabDuration);
+
+        response = "Настройки сохранены:\n";
+        response += "- Режим: Стабилизация\n";
+        response += "- Допуск: " + String(session->stabTolerance, 2) + "C\n";
+        response += "- Порог тревоги: " + String(session->stabAlertThreshold, 2) + "C\n";
+        response += "- Время: " + String(session->stabDuration) + " сек (" + String(session->stabDuration / 60) + " мин)";
+        deleteSession(chatId);
+        sendTelegramMessageToQueue(chatId, response);
+      }
+      return true;
+
+    default:
+      deleteSession(chatId);
+      return false;
+  }
+}
+
 void handleTelegramMessages() {
   // Проверяем WiFi перед любыми операциями с Telegram
   if (WiFi.status() != WL_CONNECTED) {
     telegramLastPollOk = false;
     return;
   }
-  
+
   // Дополнительная проверка стабильности WiFi
   if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
     telegramLastPollOk = false;
     return;
   }
-  
+
   ensureTelegramBot();
   if (!bot || !telegramConfigured) {
     return;
@@ -488,8 +808,44 @@ void handleTelegramMessages() {
     
     Serial.print(F("Processing command: "));
     Serial.println(command);
-    
-    if (command == "/start" || command == "/help" || command == "help" || command == "start") {
+
+    // Сначала проверяем интерактивный ввод (если есть активная сессия)
+    if (handleInteractiveInput(chat_id, originalText)) {
+      continue;  // Сообщение обработано интерактивным режимом
+    }
+
+    if (command == "/setup" || command == "setup") {
+      // Запуск интерактивного режима настройки
+      InteractiveSession* session = createSession(chat_id);
+      if (session) {
+        String message = "⚙️ *Интерактивная настройка*\n\n";
+        message += "Выберите режим работы:\n\n";
+        message += "1️⃣ Локальный - только мониторинг\n";
+        message += "2️⃣ Мониторинг - с отправкой в MQTT/Telegram\n";
+        message += "3️⃣ Оповещение - при превышении порогов\n";
+        message += "4️⃣ Стабилизация - контроль температуры\n\n";
+        message += "Введите номер (1-4) или /cancel для отмены:";
+        sendTelegramMessageToQueue(chat_id, message);
+      } else {
+        String message = "❌ *Ошибка*\n\n";
+        message += "Слишком много активных сессий. Попробуйте позже.";
+        sendTelegramMessageToQueue(chat_id, message);
+      }
+
+    } else if (command == "/cancel" || command == "cancel") {
+      // Отмена интерактивного режима
+      InteractiveSession* session = getSession(chat_id);
+      if (session) {
+        deleteSession(chat_id);
+        String message = "❌ *Настройка отменена*\n\n";
+        message += "Интерактивный режим завершен.";
+        sendTelegramMessageToQueue(chat_id, message);
+      } else {
+        String message = "ℹ️ Нет активной сессии настройки.";
+        sendTelegramMessageToQueue(chat_id, message);
+      }
+
+    } else if (command == "/start" || command == "/help" || command == "help" || command == "start") {
       Serial.println(F("Command /start or /help recognized, sending response..."));
       String message = "🌡️ *ESP32 Temperature Monitor*\n\n";
       message += "📋 *Информационные команды:*\n";
@@ -500,6 +856,9 @@ void handleTelegramMessages() {
       message += "🔹 `/mode` - текущий режим работы\n";
       message += "🔹 `/wifi` - информация о WiFi\n";
       message += "🔹 `/mqtt` - статус MQTT\n\n";
+      message += "⚙️ *Интерактивная настройка:*\n";
+      message += "🔹 `/setup` - пошаговая настройка режимов\n";
+      message += "🔹 `/cancel` - отмена настройки\n\n";
       message += "⚙️ *Команды управления режимами:*\n";
       message += "🔹 `/mode_local` - локальный режим\n";
       message += "🔹 `/mode_monitoring` - режим мониторинга\n";
@@ -510,8 +869,8 @@ void handleTelegramMessages() {
       message += "   Пример: `/alert_set 10 30 1`\n";
       message += "🔹 `/alert_get` - текущие настройки\n\n";
       message += "🎯 *Настройка стабилизации:*\n";
-      message += "🔹 `/stab_set <target> [tolerance] [alert] [duration]`\n";
-      message += "   Пример: `/stab_set 25 0.1 0.2 600`\n";
+      message += "🔹 `/stab_set [tolerance] [alert] [duration]`\n";
+      message += "   Пример: `/stab_set 0.1 0.2 600`\n";
       message += "🔹 `/stab_get` - текущие настройки\n\n";
       message += "📺 *Управление дисплеем:*\n";
       message += "🔹 `/display_on` - включить дисплей\n";
@@ -663,10 +1022,9 @@ void handleTelegramMessages() {
       } else if (mode == MODE_STABILIZATION) {
         StabilizationModeSettings stab = getStabilizationSettings();
         message += "🎯 *Настройки стабилизации:*\n";
-        message += "   Целевая: " + String(stab.targetTemp, 1) + "°C\n";
-        message += "   Допуск: " + String(stab.tolerance, 2) + "°C\n";
+        message += "   Допуск: ±" + String(stab.tolerance, 2) + "°C\n";
         message += "   Порог тревоги: " + String(stab.alertThreshold, 2) + "°C\n";
-        message += "   Длительность: " + String(stab.duration) + "с";
+        message += "   Длительность: " + String(stab.duration) + "с (" + String(stab.duration / 60) + " мин)";
       }
       
       sendTelegramMessageToQueue(chat_id, message);
@@ -784,53 +1142,58 @@ void handleTelegramMessages() {
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command.startsWith("/stab_set") || command == "stab_set") {
-      // Парсинг команды: /stab_set <target> [tolerance] [alert] [duration]
-      // Используем оригинальный text для получения параметров (после удаления @botname)
+      // Парсинг команды: /stab_set [tolerance] [alert] [duration]
+      // targetTemp убран - используется per-sensor stabTargetTemp
       int firstSpace = text.indexOf(' ');
+
+      // Значения по умолчанию
+      float tolerance = 0.1;
+      float alertThreshold = 0.2;
+      unsigned long duration = 600;
+
       if (firstSpace == -1) {
-        String message = "❌ *Ошибка формата*\n\n";
-        message += "Использование: `/stab_set <target> [tolerance] [alert] [duration]`\n";
-        message += "Пример: `/stab_set 25 0.1 0.2 600`\n\n";
-        message += "Параметры:\n";
-        message += "  target - целевая температура (°C)\n";
-        message += "  tolerance - допуск (по умолчанию 0.1°C)\n";
-        message += "  alert - порог тревоги (по умолчанию 0.2°C)\n";
-        message += "  duration - длительность в секундах (по умолчанию 600)";
+        // Без параметров - используем значения по умолчанию
+        setStabilizationSettings(tolerance, alertThreshold, duration);
+        String message = "✅ *Настройки стабилизации (по умолчанию)*\n\n";
+        message += "📏 *Допуск:* ±" + String(tolerance, 2) + "°C\n";
+        message += "⚠️ *Порог тревоги:* " + String(alertThreshold, 2) + "°C\n";
+        message += "⏱️ *Длительность:* " + String(duration) + "с (" + String(duration / 60) + " мин)\n\n";
+        message += "💡 Использование: `/stab_set [tolerance] [alert] [duration]`\n";
+        message += "   Пример: `/stab_set 0.1 0.2 600`";
         sendTelegramMessageToQueue(chat_id, message);
       } else {
         String params = text.substring(firstSpace + 1);
-        int spaces[4] = {-1, -1, -1, -1};
+        int spaces[3] = {-1, -1, -1};
         int spaceCount = 0;
-        for (int i = 0; i < params.length() && spaceCount < 3; i++) {
+        for (unsigned int i = 0; i < params.length() && spaceCount < 2; i++) {
           if (params.charAt(i) == ' ') {
             spaces[spaceCount] = i;
             spaceCount++;
           }
         }
-        
-        float targetTemp = params.substring(0, spaces[0] > 0 ? spaces[0] : params.length()).toFloat();
-        float tolerance = 0.1;
-        float alertThreshold = 0.2;
-        unsigned long duration = 600;
-        
+
+        // Первый параметр - tolerance
+        tolerance = params.substring(0, spaces[0] > 0 ? spaces[0] : params.length()).toFloat();
+
+        // Второй параметр - alertThreshold (если есть)
         if (spaces[0] > 0) {
-          tolerance = params.substring(spaces[0] + 1, spaces[1] > 0 ? spaces[1] : params.length()).toFloat();
+          alertThreshold = params.substring(spaces[0] + 1, spaces[1] > 0 ? spaces[1] : params.length()).toFloat();
         }
+
+        // Третий параметр - duration (если есть)
         if (spaces[1] > 0) {
-          alertThreshold = params.substring(spaces[1] + 1, spaces[2] > 0 ? spaces[2] : params.length()).toFloat();
+          duration = params.substring(spaces[1] + 1).toInt();
         }
-        if (spaces[2] > 0) {
-          duration = params.substring(spaces[2] + 1).toInt();
-        }
-        
-        if (targetTemp <= 0 || tolerance <= 0 || alertThreshold <= 0 || duration <= 0) {
+
+        if (tolerance <= 0 || alertThreshold <= 0 || duration <= 0) {
           String message = "❌ *Ошибка*\n\n";
-          message += "Все параметры должны быть положительными числами!";
+          message += "Все параметры должны быть положительными числами!\n\n";
+          message += "Использование: `/stab_set [tolerance] [alert] [duration]`\n";
+          message += "Пример: `/stab_set 0.1 0.2 600`";
           sendTelegramMessageToQueue(chat_id, message);
         } else {
-          setStabilizationSettings(targetTemp, tolerance, alertThreshold, duration);
+          setStabilizationSettings(tolerance, alertThreshold, duration);
           String message = "✅ *Настройки стабилизации обновлены*\n\n";
-          message += "🎯 *Целевая температура:* " + String(targetTemp, 1) + "°C\n";
           message += "📏 *Допуск:* ±" + String(tolerance, 2) + "°C\n";
           message += "⚠️ *Порог тревоги:* " + String(alertThreshold, 2) + "°C\n";
           message += "⏱️ *Длительность:* " + String(duration) + "с (" + String(duration / 60) + " мин)";
@@ -841,10 +1204,10 @@ void handleTelegramMessages() {
     } else if (command == "/stab_get" || command == "stab_get") {
       StabilizationModeSettings stab = getStabilizationSettings();
       String message = "🎯 *Настройки стабилизации*\n\n";
-      message += "📌 *Целевая температура:* " + String(stab.targetTemp, 1) + "°C\n";
       message += "📏 *Допуск:* ±" + String(stab.tolerance, 2) + "°C\n";
       message += "⚠️ *Порог тревоги:* " + String(stab.alertThreshold, 2) + "°C\n";
-      message += "⏱️ *Длительность:* " + String(stab.duration) + "с (" + String(stab.duration / 60) + " мин)";
+      message += "⏱️ *Длительность:* " + String(stab.duration) + "с (" + String(stab.duration / 60) + " мин)\n\n";
+      message += "💡 Целевая температура задается для каждого термометра отдельно.";
       
       if (getOperationMode() == MODE_STABILIZATION) {
         message += "\n\n📊 *Статус стабилизации:*\n";

@@ -73,6 +73,38 @@ bool forceReloadSettings = false;
 unsigned long lastSettingsReload = 0;
 const unsigned long SETTINGS_RELOAD_INTERVAL = 30000;
 
+// Индекс для быстрого поиска конфигурации по индексу датчика (O(1) вместо O(n))
+static int sensorToConfigIndex[MAX_SENSORS];  // -1 означает "нет конфигурации"
+
+// Вспомогательная функция для построения индекса (вызывается после loadSensorConfigs)
+static void buildSensorConfigIndex() {
+  // Инициализируем индекс значениями -1 (нет конфигурации)
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    sensorToConfigIndex[i] = -1;
+  }
+
+  int sensorCount = getSensorCount();
+  for (int i = 0; i < sensorCount && i < MAX_SENSORS; i++) {
+    String addressStr = getSensorAddressString(i);
+    // Ищем соответствующую конфигурацию
+    for (int j = 0; j < sensorConfigCount; j++) {
+      if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
+        sensorToConfigIndex[i] = j;
+        break;
+      }
+    }
+  }
+}
+
+// Вспомогательная функция для получения конфигурации по индексу датчика O(1)
+static SensorConfig* getConfigForSensor(int sensorIdx) {
+  if (sensorIdx < 0 || sensorIdx >= MAX_SENSORS) return nullptr;
+  int configIdx = sensorToConfigIndex[sensorIdx];
+  if (configIdx < 0 || configIdx >= MAX_SENSORS) return nullptr;
+  if (!sensorConfigs[configIdx].valid) return nullptr;
+  return &sensorConfigs[configIdx];
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -328,6 +360,7 @@ void setup() {
   
   // Загружаем настройки термометров
   loadSensorConfigs();
+  buildSensorConfigIndex();  // Построение индекса для O(1) поиска
 
   // Инициализация Watchdog Timer (30 сек таймаут, panic при срабатывании)
   Serial.println(F("Initializing Watchdog Timer..."));
@@ -588,6 +621,7 @@ void loop() {
     lastReloadCheck = millis();
     if (forceReloadSettings || (millis() - lastSettingsReload > SETTINGS_RELOAD_INTERVAL)) {
       loadSensorConfigs();
+      buildSensorConfigIndex();  // Перестраиваем индекс после перезагрузки настроек
       lastSettingsReload = millis();
       forceReloadSettings = false;
     }
@@ -607,16 +641,10 @@ void loop() {
         continue;
       }
       String addressStr = getSensorAddressString(i);
-      
-      // Находим настройки по адресу в кеше
-      SensorConfig* config = nullptr;
-      for (int j = 0; j < sensorConfigCount; j++) {
-        if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
-          config = &sensorConfigs[j];
-          break;
-        }
-      }
-      
+
+      // Используем O(1) поиск конфигурации через индекс
+      SensorConfig* config = getConfigForSensor(i);
+
       // Пропускаем термометры без настроек
       if (!config || !config->valid) {
         continue;
@@ -653,23 +681,15 @@ void loop() {
             sendMetricsToTelegram("", -127.0); // Пустое имя означает "отправить все"
             lastMetricsSend[i] = millis();
             
-            // Обновляем lastSentTemp для всех термометров, чтобы не отправлять повторно
-            // Упрощенная версия - обновляем только те, которые мы обрабатываем
+            // Обновляем lastSentTemp для всех термометров (O(n) вместо O(n^2))
             for (int j = 0; j < sensorCount && j < MAX_SENSORS; j++) {
               if (j == i) continue; // Уже обновили
-              uint8_t addr[8];
-              if (getSensorAddress(j, addr)) {
-                String addrStr = getSensorAddressString(j);
-                // Ищем настройки для этого термометра
-                for (int k = 0; k < sensorConfigCount; k++) {
-                  if (sensorConfigs[k].valid && sensorConfigs[k].address == addrStr) {
-                    float temp = getSensorTemperature(j);
-                    float corr = (temp != -127.0) ? (temp + sensorConfigs[k].correction) : -127.0;
-                    if (corr != -127.0) {
-                      sensorStates[j].lastSentTemp = corr;
-                    }
-                    break; // Нашли, выходим
-                  }
+              SensorConfig* jConfig = getConfigForSensor(j);
+              if (jConfig && jConfig->valid) {
+                float jTemp = getSensorTemperature(j);
+                float jCorr = (jTemp != -127.0) ? (jTemp + jConfig->correction) : -127.0;
+                if (jCorr != -127.0) {
+                  sensorStates[j].lastSentTemp = jCorr;
                 }
               }
               yield(); // Даем время другим задачам
@@ -706,24 +726,18 @@ void loop() {
             if (WiFi.status() == WL_CONNECTED) {
               sendMetricsToTelegram("", -127.0); // Пустое имя означает "отправить все"
               
-              // Обновляем lastSentTemp для всех термометров (упрощенная версия)
+              // Обновляем lastSentTemp для всех термометров (O(n) вместо O(n^2))
               for (int j = 0; j < sensorCount && j < MAX_SENSORS; j++) {
                 if (j == i) {
                   sensorStates[j].lastSentTemp = correctedTemp;
                   continue;
                 }
-                uint8_t addr[8];
-                if (getSensorAddress(j, addr)) {
-                  String addrStr = getSensorAddressString(j);
-                  for (int k = 0; k < sensorConfigCount; k++) {
-                    if (sensorConfigs[k].valid && sensorConfigs[k].address == addrStr) {
-                      float temp = getSensorTemperature(j);
-                      float corr = (temp != -127.0) ? (temp + sensorConfigs[k].correction) : -127.0;
-                      if (corr != -127.0) {
-                        sensorStates[j].lastSentTemp = corr;
-                      }
-                      break;
-                    }
+                SensorConfig* jConfig = getConfigForSensor(j);
+                if (jConfig && jConfig->valid) {
+                  float jTemp = getSensorTemperature(j);
+                  float jCorr = (jTemp != -127.0) ? (jTemp + jConfig->correction) : -127.0;
+                  if (jCorr != -127.0) {
+                    sensorStates[j].lastSentTemp = jCorr;
                   }
                 }
                 yield(); // Даем время другим задачам
