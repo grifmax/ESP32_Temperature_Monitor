@@ -96,6 +96,9 @@ volatile bool telegramTaskRunning = false;
 // Этапы интерактивного диалога
 enum InteractiveStep {
   STEP_NONE = 0,           // Нет активного диалога
+  STEP_SELECT_SENSOR,      // Выбор термометра
+  STEP_RENAME_CONFIRM,     // Подтверждение переименования
+  STEP_ENTER_NAME,         // Ввод нового имени
   STEP_SELECT_MODE,        // Выбор режима работы
   STEP_ALERT_MIN_TEMP,     // Ввод минимальной температуры
   STEP_ALERT_MAX_TEMP,     // Ввод максимальной температуры
@@ -110,7 +113,10 @@ struct InteractiveSession {
   String chatId;                    // ID чата
   InteractiveStep step;             // Текущий этап
   unsigned long lastActivity;       // Время последней активности
-  OperationMode selectedMode;       // Выбранный режим
+  int selectedSensorIndex;          // Индекс выбранного термометра
+  String selectedSensorAddress;     // Адрес выбранного термометра
+  String sensorName;                // Имя термометра (текущее или новое)
+  String selectedModeStr;           // Выбранный режим (строка)
   float alertMinTemp;               // Временные настройки оповещения
   float alertMaxTemp;
   bool alertBuzzer;
@@ -167,16 +173,20 @@ static InteractiveSession* createSession(const String& chatId) {
   for (int i = 0; i < MAX_INTERACTIVE_SESSIONS; i++) {
     if (!sessions[i].valid) {
       sessions[i].chatId = chatId;
-      sessions[i].step = STEP_SELECT_MODE;
+      sessions[i].step = STEP_SELECT_SENSOR;  // Начинаем с выбора термометра
       sessions[i].lastActivity = now;
       sessions[i].valid = true;
       // Инициализация значений по умолчанию
+      sessions[i].selectedSensorIndex = -1;
+      sessions[i].selectedSensorAddress = "";
+      sessions[i].sensorName = "";
+      sessions[i].selectedModeStr = "monitoring";
       sessions[i].alertMinTemp = 10.0;
       sessions[i].alertMaxTemp = 30.0;
       sessions[i].alertBuzzer = true;
       sessions[i].stabTolerance = 0.1;
       sessions[i].stabAlertThreshold = 0.2;
-      sessions[i].stabDuration = 600;
+      sessions[i].stabDuration = 10;  // 10 минут по умолчанию
       return &sessions[i];
     }
   }
@@ -559,6 +569,66 @@ void startTelegramBot() {
   }
 }
 
+// Функция сохранения настроек термометра
+static bool saveSensorSettings(InteractiveSession* session) {
+  // Загружаем текущие настройки
+  String settingsJson = getSettings();
+  StaticJsonDocument<8192> doc;
+  DeserializationError error = deserializeJson(doc, settingsJson);
+  if (error) {
+    Serial.println(F("TG: Failed to parse settings for sensor update"));
+    return false;
+  }
+
+  // Ищем датчик по адресу и обновляем его настройки
+  JsonArray sensors = doc["sensors"].as<JsonArray>();
+  bool found = false;
+
+  for (JsonObject sensor : sensors) {
+    if (sensor["address"].as<String>() == session->selectedSensorAddress) {
+      // Обновляем имя если было изменено
+      if (session->sensorName.length() > 0) {
+        sensor["name"] = session->sensorName;
+      }
+      // Обновляем режим
+      sensor["mode"] = session->selectedModeStr;
+
+      // Обновляем настройки в зависимости от режима
+      if (session->selectedModeStr == "alert") {
+        JsonObject alertSettings = sensor["alertSettings"].to<JsonObject>();
+        alertSettings["minTemp"] = session->alertMinTemp;
+        alertSettings["maxTemp"] = session->alertMaxTemp;
+        alertSettings["buzzerEnabled"] = session->alertBuzzer;
+      } else if (session->selectedModeStr == "stabilization") {
+        JsonObject stabSettings = sensor["stabilizationSettings"].to<JsonObject>();
+        stabSettings["tolerance"] = session->stabTolerance;
+        stabSettings["alertThreshold"] = session->stabAlertThreshold;
+        stabSettings["duration"] = session->stabDuration;
+        stabSettings["buzzerEnabled"] = true;
+      }
+
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    Serial.println(F("TG: Sensor not found for update"));
+    return false;
+  }
+
+  // Сохраняем настройки
+  String output;
+  serializeJson(doc, output);
+  if (saveSettings(output)) {
+    // Устанавливаем флаг для перезагрузки настроек
+    extern bool forceReloadSettings;
+    forceReloadSettings = true;
+    return true;
+  }
+  return false;
+}
+
 // Обработка интерактивного ввода
 static bool handleInteractiveInput(const String& chatId, const String& text) {
   InteractiveSession* session = getSession(chatId);
@@ -570,31 +640,109 @@ static bool handleInteractiveInput(const String& chatId, const String& text) {
   int choice = text.toInt();
 
   switch (session->step) {
+    case STEP_SELECT_SENSOR:
+      {
+        int sensorCount = getSensorCount();
+        if (choice < 1 || choice > sensorCount) {
+          response = "Неверный выбор. Введите число от 1 до " + String(sensorCount) + ":";
+          sendTelegramMessageToQueue(chatId, response);
+          return true;
+        }
+
+        session->selectedSensorIndex = choice - 1;
+
+        // Получаем адрес и имя выбранного датчика
+        String addressStr = getSensorAddressString(session->selectedSensorIndex);
+        session->selectedSensorAddress = addressStr;
+
+        // Ищем имя в конфигурации
+        String currentName = "Термометр " + String(choice);
+        for (int j = 0; j < MAX_SENSORS; j++) {
+          if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
+            if (sensorConfigs[j].name.length() > 0) {
+              currentName = sensorConfigs[j].name;
+            }
+            break;
+          }
+        }
+        session->sensorName = currentName;
+
+        session->step = STEP_RENAME_CONFIRM;
+        response = "Выбран: *" + currentName + "*\n\n";
+        response += "Хотите переименовать термометр?\n";
+        response += "1. Да\n";
+        response += "2. Нет, оставить \"" + currentName + "\"";
+        sendTelegramMessageToQueue(chatId, response);
+      }
+      return true;
+
+    case STEP_RENAME_CONFIRM:
+      if (choice == 1) {
+        session->step = STEP_ENTER_NAME;
+        response = "Введите новое имя для термометра:";
+      } else if (choice == 2) {
+        session->step = STEP_SELECT_MODE;
+        response = "Имя оставлено: *" + session->sensorName + "*\n\n";
+        response += "Выберите режим работы:\n";
+        response += "1. Мониторинг (только отображение)\n";
+        response += "2. Оповещение (мин/макс температура)\n";
+        response += "3. Стабилизация (отслеживание скачков)";
+      } else {
+        response = "Введите 1 (Да) или 2 (Нет):";
+      }
+      sendTelegramMessageToQueue(chatId, response);
+      return true;
+
+    case STEP_ENTER_NAME:
+      {
+        String newName = text;
+        newName.trim();
+        if (newName.length() == 0 || newName.length() > 32) {
+          response = "Имя должно быть от 1 до 32 символов. Попробуйте ещё раз:";
+          sendTelegramMessageToQueue(chatId, response);
+          return true;
+        }
+        session->sensorName = newName;
+        session->step = STEP_SELECT_MODE;
+        response = "Новое имя: *" + newName + "*\n\n";
+        response += "Выберите режим работы:\n";
+        response += "1. Мониторинг (только отображение)\n";
+        response += "2. Оповещение (мин/макс температура)\n";
+        response += "3. Стабилизация (отслеживание скачков)";
+        sendTelegramMessageToQueue(chatId, response);
+      }
+      return true;
+
     case STEP_SELECT_MODE:
-      if (choice < 1 || choice > 4) {
-        response = "Неверный выбор. Введите число от 1 до 4:";
+      if (choice < 1 || choice > 3) {
+        response = "Неверный выбор. Введите число от 1 до 3:";
         sendTelegramMessageToQueue(chatId, response);
         return true;
       }
-      switch (choice) {
-        case 1: session->selectedMode = MODE_LOCAL; break;
-        case 2: session->selectedMode = MODE_MONITORING; break;
-        case 3: session->selectedMode = MODE_ALERT; break;
-        case 4: session->selectedMode = MODE_STABILIZATION; break;
-      }
 
-      if (session->selectedMode == MODE_ALERT) {
-        session->step = STEP_ALERT_MIN_TEMP;
-        response = "Режим оповещения выбран.\n\nВведите минимальную температуру (C):";
-      } else if (session->selectedMode == MODE_STABILIZATION) {
-        session->step = STEP_STAB_TOLERANCE;
-        response = "Режим стабилизации выбран.\n\nВведите допуск температуры (C, по умолчанию 0.1):";
-      } else {
-        // MODE_LOCAL или MODE_MONITORING - сразу применяем
-        setOperationMode(session->selectedMode);
-        const char* modeNames[] = {"Локальный", "Мониторинг", "Оповещение", "Стабилизация"};
-        response = "Настройки сохранены:\n- Режим: " + String(modeNames[session->selectedMode]);
-        deleteSession(chatId);
+      switch (choice) {
+        case 1:
+          session->selectedModeStr = "monitoring";
+          // Сразу сохраняем - для мониторинга нет дополнительных настроек
+          if (saveSensorSettings(session)) {
+            response = "✅ *Настройки сохранены*\n\n";
+            response += "🌡️ *" + session->sensorName + "*\n";
+            response += "📊 Режим: Мониторинг";
+          } else {
+            response = "❌ Ошибка сохранения настроек";
+          }
+          deleteSession(chatId);
+          break;
+        case 2:
+          session->selectedModeStr = "alert";
+          session->step = STEP_ALERT_MIN_TEMP;
+          response = "Режим оповещения.\n\nВведите минимальную температуру (°C):";
+          break;
+        case 3:
+          session->selectedModeStr = "stabilization";
+          session->step = STEP_STAB_TOLERANCE;
+          response = "Режим стабилизации.\n\nВведите допуск температуры (°C, по умолчанию 0.1):";
+          break;
       }
       sendTelegramMessageToQueue(chatId, response);
       return true;
@@ -609,7 +757,7 @@ static bool handleInteractiveInput(const String& chatId, const String& text) {
         }
         session->alertMinTemp = temp;
         session->step = STEP_ALERT_MAX_TEMP;
-        response = "Минимальная температура: " + String(temp, 1) + "C\n\nВведите максимальную температуру (C):";
+        response = "Минимальная: " + String(temp, 1) + "°C\n\nВведите максимальную температуру (°C):";
         sendTelegramMessageToQueue(chatId, response);
       }
       return true;
@@ -618,14 +766,14 @@ static bool handleInteractiveInput(const String& chatId, const String& text) {
       {
         float temp = text.toFloat();
         if (temp < -55 || temp > 125 || temp <= session->alertMinTemp) {
-          response = "Некорректная температура. Должна быть больше минимальной (" +
-                     String(session->alertMinTemp, 1) + "C):";
+          response = "Температура должна быть больше минимальной (" +
+                     String(session->alertMinTemp, 1) + "°C):";
           sendTelegramMessageToQueue(chatId, response);
           return true;
         }
         session->alertMaxTemp = temp;
         session->step = STEP_ALERT_BUZZER;
-        response = "Максимальная температура: " + String(temp, 1) + "C\n\nВключить зуммер?\n1. Да\n2. Нет";
+        response = "Максимальная: " + String(temp, 1) + "°C\n\nВключить зуммер при тревоге?\n1. Да\n2. Нет";
         sendTelegramMessageToQueue(chatId, response);
       }
       return true;
@@ -638,15 +786,17 @@ static bool handleInteractiveInput(const String& chatId, const String& text) {
       }
       session->alertBuzzer = (choice == 1);
 
-      // Применяем настройки
-      setOperationMode(MODE_ALERT);
-      setAlertSettings(session->alertMinTemp, session->alertMaxTemp, session->alertBuzzer);
-
-      response = "Настройки сохранены:\n";
-      response += "- Режим: Оповещение\n";
-      response += "- Мин. температура: " + String(session->alertMinTemp, 1) + "C\n";
-      response += "- Макс. температура: " + String(session->alertMaxTemp, 1) + "C\n";
-      response += "- Зуммер: " + String(session->alertBuzzer ? "Включен" : "Выключен");
+      // Сохраняем настройки термометра
+      if (saveSensorSettings(session)) {
+        response = "✅ *Настройки сохранены*\n\n";
+        response += "🌡️ *" + session->sensorName + "*\n";
+        response += "🔔 Режим: Оповещение\n";
+        response += "📉 Мин: " + String(session->alertMinTemp, 1) + "°C\n";
+        response += "📈 Макс: " + String(session->alertMaxTemp, 1) + "°C\n";
+        response += "🔊 Зуммер: " + String(session->alertBuzzer ? "Да" : "Нет");
+      } else {
+        response = "❌ Ошибка сохранения настроек";
+      }
       deleteSession(chatId);
       sendTelegramMessageToQueue(chatId, response);
       return true;
@@ -654,14 +804,14 @@ static bool handleInteractiveInput(const String& chatId, const String& text) {
     case STEP_STAB_TOLERANCE:
       {
         float tol = text.toFloat();
-        if (tol < 0.1 || tol > 10) {
-          response = "Некорректное значение. Введите допуск от 0.1 до 10:";
+        if (tol < 0.01 || tol > 5) {
+          response = "Введите допуск от 0.01 до 5:";
           sendTelegramMessageToQueue(chatId, response);
           return true;
         }
         session->stabTolerance = tol;
         session->step = STEP_STAB_ALERT;
-        response = "Допуск: " + String(tol, 2) + "C\n\nВведите порог тревоги (C, по умолчанию 0.2):";
+        response = "Допуск: " + String(tol, 2) + "°C\n\nВведите порог тревоги (°C, по умолчанию 0.2):";
         sendTelegramMessageToQueue(chatId, response);
       }
       return true;
@@ -669,38 +819,40 @@ static bool handleInteractiveInput(const String& chatId, const String& text) {
     case STEP_STAB_ALERT:
       {
         float alert = text.toFloat();
-        if (alert < 0.1 || alert > 20) {
-          response = "Некорректное значение. Введите от 0.1 до 20:";
+        if (alert < 0.05 || alert > 10) {
+          response = "Введите от 0.05 до 10:";
           sendTelegramMessageToQueue(chatId, response);
           return true;
         }
         session->stabAlertThreshold = alert;
         session->step = STEP_STAB_DURATION;
-        response = "Порог тревоги: " + String(alert, 2) + "C\n\n";
-        response += "Введите время стабилизации в секундах (по умолчанию 600 = 10 минут):";
+        response = "Порог тревоги: " + String(alert, 2) + "°C\n\n";
+        response += "Введите время стабилизации в минутах (1-60, по умолчанию 10):";
         sendTelegramMessageToQueue(chatId, response);
       }
       return true;
 
     case STEP_STAB_DURATION:
       {
-        unsigned long dur = text.toInt();
-        if (dur < 1 || dur > 3600) {
-          response = "Некорректное значение. Введите от 1 до 3600 секунд:";
+        int dur = text.toInt();
+        if (dur < 1 || dur > 60) {
+          response = "Введите от 1 до 60 минут:";
           sendTelegramMessageToQueue(chatId, response);
           return true;
         }
         session->stabDuration = dur;
 
-        // Применяем настройки
-        setOperationMode(MODE_STABILIZATION);
-        setStabilizationSettings(session->stabTolerance, session->stabAlertThreshold, session->stabDuration);
-
-        response = "Настройки сохранены:\n";
-        response += "- Режим: Стабилизация\n";
-        response += "- Допуск: " + String(session->stabTolerance, 2) + "C\n";
-        response += "- Порог тревоги: " + String(session->stabAlertThreshold, 2) + "C\n";
-        response += "- Время: " + String(session->stabDuration) + " сек (" + String(session->stabDuration / 60) + " мин)";
+        // Сохраняем настройки термометра
+        if (saveSensorSettings(session)) {
+          response = "✅ *Настройки сохранены*\n\n";
+          response += "🌡️ *" + session->sensorName + "*\n";
+          response += "🎯 Режим: Стабилизация\n";
+          response += "📏 Допуск: " + String(session->stabTolerance, 2) + "°C\n";
+          response += "⚠️ Порог тревоги: " + String(session->stabAlertThreshold, 2) + "°C\n";
+          response += "⏱️ Время: " + String(session->stabDuration) + " мин";
+        } else {
+          response = "❌ Ошибка сохранения настроек";
+        }
         deleteSession(chatId);
         sendTelegramMessageToQueue(chatId, response);
       }
@@ -815,21 +967,49 @@ void handleTelegramMessages() {
     }
 
     if (command == "/setup" || command == "setup") {
-      // Запуск интерактивного режима настройки
+      // Запуск интерактивного режима настройки термометра
+      int sensorCount = getSensorCount();
+      if (sensorCount == 0) {
+        sendTelegramMessageToQueue(chat_id, "❌ Термометры не найдены");
+        continue;
+      }
+
       InteractiveSession* session = createSession(chat_id);
       if (session) {
-        String message = "⚙️ *Интерактивная настройка*\n\n";
-        message += "Выберите режим работы:\n\n";
-        message += "1️⃣ Локальный - только мониторинг\n";
-        message += "2️⃣ Мониторинг - с отправкой в MQTT/Telegram\n";
-        message += "3️⃣ Оповещение - при превышении порогов\n";
-        message += "4️⃣ Стабилизация - контроль температуры\n\n";
-        message += "Введите номер (1-4) или /cancel для отмены:";
+        String message = "⚙️ *Настройка термометра*\n\n";
+        message += "Выберите термометр:\n\n";
+
+        // Выводим список термометров
+        for (int i = 0; i < sensorCount && i < MAX_SENSORS; i++) {
+          String addressStr = getSensorAddressString(i);
+          String name = "Термометр " + String(i + 1);
+          String mode = "📊";
+          float temp = getSensorTemperature(i);
+
+          // Ищем настройки по адресу
+          for (int j = 0; j < MAX_SENSORS; j++) {
+            if (sensorConfigs[j].valid && sensorConfigs[j].address == addressStr) {
+              if (sensorConfigs[j].name.length() > 0) {
+                name = sensorConfigs[j].name;
+              }
+              if (sensorConfigs[j].mode == "monitoring") mode = "📊";
+              else if (sensorConfigs[j].mode == "alert") mode = "🔔";
+              else if (sensorConfigs[j].mode == "stabilization") mode = "🎯";
+              break;
+            }
+          }
+
+          message += String(i + 1) + ". " + mode + " *" + name + "*";
+          if (temp > -100) {
+            message += " (" + String(temp, 1) + "°C)";
+          }
+          message += "\n";
+        }
+
+        message += "\nВведите номер (1-" + String(sensorCount) + ") или /cancel:";
         sendTelegramMessageToQueue(chat_id, message);
       } else {
-        String message = "❌ *Ошибка*\n\n";
-        message += "Слишком много активных сессий. Попробуйте позже.";
-        sendTelegramMessageToQueue(chat_id, message);
+        sendTelegramMessageToQueue(chat_id, "❌ Слишком много сессий. Попробуйте позже.");
       }
 
     } else if (command == "/cancel" || command == "cancel") {
@@ -849,40 +1029,27 @@ void handleTelegramMessages() {
       Serial.println(F("Command /start or /help recognized, sending response..."));
       String message = "🌡️ *ESP32 Temperature Monitor*\n\n";
       message += "📋 *Информационные команды:*\n";
-      message += "🔹 `/status` - текущий статус устройства\n";
+      message += "🔹 `/status` - текущий статус\n";
       message += "🔹 `/temp` - текущая температура\n";
-      message += "🔹 `/sensors` - список всех датчиков\n";
+      message += "🔹 `/sensors` - список датчиков\n";
       message += "🔹 `/info` - подробная информация\n";
-      message += "🔹 `/mode` - текущий режим работы\n";
       message += "🔹 `/wifi` - информация о WiFi\n";
       message += "🔹 `/mqtt` - статус MQTT\n\n";
-      message += "⚙️ *Интерактивная настройка:*\n";
-      message += "🔹 `/setup` - пошаговая настройка режимов\n";
+      message += "⚙️ *Настройка термометров:*\n";
+      message += "🔹 `/setup` - настройка термометра\n";
+      message += "   (выбор, переименование, режим)\n";
       message += "🔹 `/cancel` - отмена настройки\n\n";
-      message += "⚙️ *Команды управления режимами:*\n";
-      message += "🔹 `/mode_local` - локальный режим\n";
-      message += "🔹 `/mode_monitoring` - режим мониторинга\n";
-      message += "🔹 `/mode_alert` - режим оповещения\n";
-      message += "🔹 `/mode_stabilization` - режим стабилизации\n\n";
-      message += "🔔 *Настройка оповещений:*\n";
-      message += "🔹 `/alert_set <min> <max> [buzzer]` - установить пороги\n";
-      message += "   Пример: `/alert_set 10 30 1`\n";
-      message += "🔹 `/alert_get` - текущие настройки\n\n";
-      message += "🎯 *Настройка стабилизации:*\n";
-      message += "🔹 `/stab_set [tolerance] [alert] [duration]`\n";
-      message += "   Пример: `/stab_set 0.1 0.2 600`\n";
-      message += "🔹 `/stab_get` - текущие настройки\n\n";
       message += "📺 *Управление дисплеем:*\n";
-      message += "🔹 `/display_on` - включить дисплей\n";
-      message += "🔹 `/display_off` - выключить дисплей\n";
+      message += "🔹 `/display_on` - включить\n";
+      message += "🔹 `/display_off` - выключить\n";
       message += "🔹 `/display_temp` - показать температуру\n";
       message += "🔹 `/display_info` - показать информацию\n\n";
-      message += "🔊 *Управление зуммером:*\n";
+      message += "🔊 *Зуммер:*\n";
       message += "🔹 `/buzzer_test` - тест зуммера\n\n";
-      message += "🛠️ *Системные команды:*\n";
-      message += "🔹 `/reboot` - перезагрузить устройство\n";
+      message += "🛠️ *Системные:*\n";
+      message += "🔹 `/reboot` - перезагрузить\n";
       message += "🔹 `/help` - эта справка\n";
-      
+
       sendTelegramMessageToQueue(chat_id, message);
       
     } else if (command == "/status" || command == "/temp" || command == "status" || command == "temp") {

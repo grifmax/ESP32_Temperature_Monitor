@@ -1034,6 +1034,48 @@ void startWebServer() {
       }
     });
   
+  // API для прямого сохранения настроек Telegram в NVS (обходит очередь сохранения)
+  server.on("/api/telegram/config", HTTP_POST,
+    [](AsyncWebServerRequest *request){},
+    NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      if (index == 0 && len == total && len < 512) {
+        String body = String((char*)data).substring(0, len);
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, body);
+
+        if (error) {
+          request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
+          return;
+        }
+
+        String token = doc["bot_token"] | "";
+        String chatId = doc["chat_id"] | "";
+
+        if (token.length() == 0 || chatId.length() == 0) {
+          request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"bot_token and chat_id required\"}");
+          return;
+        }
+
+        // Сохраняем напрямую в NVS
+        preferences.begin(PREF_NAMESPACE, false);
+        preferences.putString(PREF_TG_TOKEN, token);
+        preferences.putString(PREF_TG_CHATID, chatId);
+        preferences.end();
+
+        // Применяем настройки
+        setTelegramConfig(token, chatId);
+
+        Serial.println(F("Telegram config saved to NVS directly"));
+        Serial.print(F("Token: "));
+        Serial.println(token.length() > 0 ? "***" : "(empty)");
+        Serial.print(F("Chat ID: "));
+        Serial.println(chatId);
+
+        request->send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Telegram config saved to NVS\"}");
+      }
+    });
+
   // API для отправки тестового сообщения в Telegram
   server.on("/api/telegram/test", HTTP_POST, [](AsyncWebServerRequest *request){
     yield(); // Даем время другим задачам
@@ -1055,6 +1097,51 @@ void startWebServer() {
     }
   });
   
+  // API для прямого сохранения настроек MQTT в NVS (обходит очередь сохранения)
+  server.on("/api/mqtt/config", HTTP_POST,
+    [](AsyncWebServerRequest *request){},
+    NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+      if (index == 0 && len == total && len < 1024) {
+        String body = String((char*)data).substring(0, len);
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, body);
+
+        if (error) {
+          request->send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
+          return;
+        }
+
+        String mqttServer = doc["server"] | "";
+        int port = doc["port"] | 1883;
+        String user = doc["user"] | "";
+        String password = doc["password"] | "";
+        String topicStatus = doc["topic_status"] | "home/thermo/status";
+        String topicControl = doc["topic_control"] | "home/thermo/control";
+        String security = doc["security"] | "none";
+
+        // Сохраняем напрямую в NVS
+        preferences.begin(PREF_NAMESPACE, false);
+        preferences.putString(PREF_MQTT_SERVER, mqttServer);
+        preferences.putInt(PREF_MQTT_PORT, port);
+        preferences.putString(PREF_MQTT_USER, user);
+        preferences.putString(PREF_MQTT_PASS, password);
+        preferences.putString(PREF_MQTT_TOPIC_ST, topicStatus);
+        preferences.putString(PREF_MQTT_TOPIC_CT, topicControl);
+        preferences.putString(PREF_MQTT_SEC, security);
+        preferences.end();
+
+        // Применяем настройки
+        setMqttConfig(mqttServer, port, user, password, topicStatus, topicControl, security);
+
+        Serial.println(F("MQTT config saved to NVS directly"));
+        Serial.print(F("Server: "));
+        Serial.println(mqttServer.length() > 0 ? mqttServer : "(empty)");
+
+        request->send(200, "application/json", "{\"status\":\"ok\",\"message\":\"MQTT config saved to NVS\"}");
+      }
+    });
+
   // API для отправки тестового сообщения в MQTT
   server.on("/api/mqtt/test", HTTP_POST, [](AsyncWebServerRequest *request){
     yield();
@@ -1164,41 +1251,36 @@ String getSettings() {
   
   preferences.end();
   
-  // Если в Preferences есть данные, используем их (приоритет над SPIFFS для критичных настроек)
-  bool usePrefs = false;
+  // NVS имеет ПРИОРИТЕТ над SPIFFS для критичных настроек (WiFi, Telegram, MQTT)
+  // Это гарантирует, что настройки не потеряются при перепрошивке файловой системы
+  bool nvsUsed = false;
+
+  // WiFi: NVS приоритет если там есть данные
   if (wifiSsid.length() > 0) {
     String spiffsSsid = doc.containsKey("wifi") ? doc["wifi"]["ssid"].as<String>() : "";
-    if (spiffsSsid.length() == 0) {
-      usePrefs = true;
-      Serial.println(F("WiFi SSID from Preferences (SPIFFS empty)"));
-    }
-  }
-  if (tgToken.length() > 0) {
-    String spiffsToken = doc.containsKey("telegram") ? doc["telegram"]["bot_token"].as<String>() : "";
-    if (spiffsToken.length() == 0) {
-      usePrefs = true;
-      Serial.println(F("Telegram token from Preferences (SPIFFS empty)"));
-    }
-  }
-  if (mqttServer.length() > 0) {
-    String spiffsMqtt = doc.containsKey("mqtt") ? doc["mqtt"]["server"].as<String>() : "";
-    if (spiffsMqtt.length() == 0) {
-      usePrefs = true;
-      Serial.println(F("MQTT server from Preferences (SPIFFS empty)"));
-    }
-  }
-  
-  if (usePrefs && (wifiSsid.length() > 0 || tgToken.length() > 0 || mqttServer.length() > 0)) {
-    Serial.println(F("Loading critical settings from Preferences (NVS)"));
-    if (wifiSsid.length() > 0) {
+    if (spiffsSsid != wifiSsid) {
       doc["wifi"]["ssid"] = wifiSsid;
       doc["wifi"]["password"] = wifiPass;
+      nvsUsed = true;
+      Serial.println(F("WiFi loaded from NVS (priority)"));
     }
-    if (tgToken.length() > 0) {
+  }
+
+  // Telegram: NVS приоритет если там есть данные
+  if (tgToken.length() > 0) {
+    String spiffsToken = doc.containsKey("telegram") ? doc["telegram"]["bot_token"].as<String>() : "";
+    if (spiffsToken != tgToken || spiffsToken.length() == 0) {
       doc["telegram"]["bot_token"] = tgToken;
       doc["telegram"]["chat_id"] = tgChatId;
+      nvsUsed = true;
+      Serial.println(F("Telegram loaded from NVS (priority)"));
     }
-    if (mqttServer.length() > 0) {
+  }
+
+  // MQTT: NVS приоритет если там есть данные
+  if (mqttServer.length() > 0) {
+    String spiffsMqtt = doc.containsKey("mqtt") ? doc["mqtt"]["server"].as<String>() : "";
+    if (spiffsMqtt != mqttServer || spiffsMqtt.length() == 0) {
       doc["mqtt"]["server"] = mqttServer;
       if (mqttPort > 0) {
         doc["mqtt"]["port"] = mqttPort;
@@ -1214,9 +1296,15 @@ String getSettings() {
       if (mqttSec.length() > 0) {
         doc["mqtt"]["security"] = mqttSec;
       }
+      nvsUsed = true;
+      Serial.println(F("MQTT loaded from NVS (priority)"));
     }
   }
-  
+
+  if (nvsUsed) {
+    Serial.println(F("Critical settings restored from NVS"));
+  }
+
   // Устанавливаем значения по умолчанию, если их нет
   if (!doc.containsKey("wifi")) {
     doc["wifi"]["ssid"] = "";
